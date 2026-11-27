@@ -34,7 +34,7 @@ node server/launch.js         # same thing from a terminal; `node server/index.j
 Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
 
 ```bash
-npm test    # 127 tests: unit tests + end-to-end SSH/SFTP/deploy/nginx/PHP/Go/Java tests against a real sshd (skipped if sshd isn't installed)
+npm test    # 129 tests: unit tests + end-to-end SSH/SFTP/deploy/nginx/PHP/Go/Java tests against a real sshd (skipped if sshd isn't installed)
 ```
 
 ## Adding a server

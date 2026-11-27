@@ -70,6 +70,17 @@ test('presets: every framework produces valid scripts in every mode', () => {
   assert.equal(spawnSync('bash', ['-n', path.join(dir, 't.sh')]).status, 0);
 });
 
+test('presets: build/install steps never hide failures behind && chains', () => {
+  // a failure on the left of `&&` is exempt from `set -e`, so multi-step presets must use separate statements
+  for (const p of P.PRESETS) for (const k of ['install', 'build']) {
+    const text = p[k] || '';
+    for (const line of text.split('\n')) {
+      const stripped = line.replace(/"[^"]*"|'[^']*'/g, '');
+      assert.ok(!/(^|\s)(npm (ci|install)[^&|;]*|composer install[^&|;]*|go mod download|\.venv\/bin\/pip[^&|;]*) &&/.test(stripped), `${p.id}.${k}: "${line.trim().slice(0, 70)}" chains a dependency step with &&`);
+    }
+  }
+});
+
 test('presets: resolve() merges the app\'s overrides with the preset defaults', () => {
   assert.deepEqual([P.resolve({ framework: 'nextjs' }).mode, P.resolve({ framework: 'static-spa' }).mode, P.resolve({ framework: 'laravel' }).mode, P.resolve({ framework: 'spring' }).mode, P.resolve({ framework: 'dotnet' }).mode], ['service', 'static', 'php', 'service', 'service']);
   assert.equal(P.resolve({ framework: 'nestjs' }).start, 'node dist/main.js');
@@ -398,6 +409,20 @@ test('PHP mode: nginx serves live/ through PHP-FPM; real nginx validates the gen
   assert.ok(!c.includes('proxy_pass'));
   assert.equal(site.json.site.upstreamLabel, 'app: phpapp (Laravel / PHP)');
   await st.call('DELETE', `/api/sites?id=${site.json.site.id}`);
+});
+
+test('PHP mode: a failing front-end build FAILS the deploy (it must never go live half-built)', { skip: skip || !hasBin('php') || !hasBin('composer') || !hasBin('npm') }, async () => {
+  const repo = gitRepo(PHP(1, { 'package.json': JSON.stringify({ name: 'assets', scripts: { build: 'node -e "console.error(\'vite exploded\'); process.exit(3)"' } }) }));
+  const app = await mkApp({ name: 'phpassets', framework: 'laravel', repoUrl: repo.url, runAs: 'root' });
+  const r = await deploy(app.id);
+  assert.equal(r.deploy.status, 'failed', r.log);
+  assert.ok(r.log.includes('vite exploded'));
+  assert.ok(!r.log.includes('Going live'), 'never went live');
+  assert.ok(!fs.existsSync(path.join(appsDir(), 'phpassets/current')), 'nothing is live');
+  assert.ok(!r.log.includes('Running the release command'), 'no migrations ran against a broken build');
+  // and the same app deploys fine once the build works
+  repo.commit({ 'package.json': JSON.stringify({ name: 'assets', scripts: { build: 'node -e "0"' } }) });
+  assert.equal((await deploy(app.id)).deploy.status, 'success');
 });
 
 test('PHP mode as another Linux user: files, storage and artisan belong to the app user (sudo -u)', { skip: skip || !hasBin('php') || !hasBin('composer') || !hasBin('sudo') || !hasBin('useradd') }, async () => {

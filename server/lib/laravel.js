@@ -44,9 +44,9 @@ echo "me=$(id -un)"
 echo "artisan=$([ -f "$P/artisan" ] && echo 1 || echo 0)"
 echo "vendor=$([ -d "$P/vendor" ] && echo 1 || echo 0)"
 echo "env=$([ -f "$P/.env" ] && echo 1 || echo 0)"
-echo "owner=$(stat -c %U "$P/storage" 2>/dev/null)"
-echo "group=$(stat -c %G "$P/storage" 2>/dev/null)"
-echo "storageMode=$(stat -c %a "$P/storage" 2>/dev/null)"
+echo "owner=$(stat -L -c %U "$P/storage" 2>/dev/null)"
+echo "group=$(stat -L -c %G "$P/storage" 2>/dev/null)"
+echo "storageMode=$(stat -L -c %a "$P/storage" 2>/dev/null)"
 echo "php=$(command -v php >/dev/null 2>&1 && php -r 'echo PHP_VERSION;' 2>/dev/null)"
 echo "composer=$(command -v composer >/dev/null 2>&1 && echo 1 || echo 0)"
 echo "node=$(command -v node >/dev/null 2>&1 && node --version 2>/dev/null)"
@@ -101,7 +101,7 @@ class LaravelManager {
     // envkey_APP_ENV=production lines were prefixed with "envkey_" and kept their own "KEY=VALUE"
     for (const line of r.stdout.split('\n')) {
       const m = line.match(/^envkey_([A-Z_]+)=(.*)$/);
-      if (m) o.envKeys[m[1]] = m[2].trim();
+      if (m) o.envKeys[m[1]] = m[2].trim().replace(/^(["'])(.*)\1$/, '$2'); // .env values are often quoted
     }
     if (o.error) throw httpError(404, o.error);
     return {

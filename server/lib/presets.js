@@ -20,7 +20,16 @@ const PRESETS = [
     description: 'Composer install, optional asset build, database migrations, shared storage, PHP-FPM reload.',
     detect: '[ -f artisan ] && [ -f composer.json ]',
     install: 'composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist',
-    build: 'if [ -f package.json ] && command -v npm >/dev/null; then npm ci --no-audit --no-fund && npm run build; else echo "(no front-end build)"; fi; php artisan config:cache && php artisan route:cache && php artisan view:cache',
+    // one statement per line on purpose: a failure inside an `A && B` chain would NOT stop the deploy under `set -e`
+    build: `if [ -f package.json ] && command -v npm >/dev/null; then
+${NPM_INSTALL}
+${NPM_BUILD}
+else
+echo "(no front-end build)"
+fi
+php artisan config:cache
+php artisan route:cache
+php artisan view:cache`,
     releaseCmd: 'php artisan migrate --force', afterCmd: 'php artisan queue:restart',
     reloadCmd: 'php artisan config:cache && php artisan queue:restart',
     outputDir: 'public', sharedPaths: ['storage'], healthPath: '/', spa: false,
@@ -90,7 +99,7 @@ const PRESETS = [
     id: 'python', label: 'Python (Django / Flask / FastAPI)', group: 'Other', mode: 'service', icon: '🐍', tools: ['python'],
     description: 'Creates a virtualenv, installs requirements.txt and runs your start command (default: gunicorn app:app).',
     detect: '[ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f manage.py ]',
-    install: 'python3 -m venv .venv && if [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi',
+    install: 'python3 -m venv .venv\nif [ -f requirements.txt ]; then .venv/bin/pip install -r requirements.txt; fi',
     build: '', start: 'exec .venv/bin/gunicorn --bind 127.0.0.1:$PORT app:app', healthPath: '/', sharedPaths: [],
   },
   {

@@ -118,11 +118,13 @@ async function makeStack() {
   stack.call = async (method, url, body, { server, cookieOverride, headers = {} } = {}) => {
     const sid = server === undefined ? stack.serverId : server;
     const u = GLOBAL.test(url) || !sid ? url : url + (url.includes('?') ? '&' : '?') + 'server=' + sid;
-    const res = await fetch(base + u, {
+    const send = () => fetch(base + u, {
       method,
       headers: { 'X-Panel-Request': '1', ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), Cookie: cookieOverride ?? stack.cookie, ...headers },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
+    // a keep-alive socket the server already closed after 5 idle seconds fails with ECONNRESET before anything is sent: retry once
+    const res = await send().catch((e) => { if (e && e.cause && e.cause.code === 'ECONNRESET') return send(); throw e; });
     let json = null; try { json = await res.json(); } catch { /* none */ }
     return { status: res.status, json, setCookie: res.headers.get('set-cookie'), raw: JSON.stringify(json) };
   };

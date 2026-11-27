@@ -41,7 +41,7 @@ function makeLaravel(dir) {
   fs.writeFileSync(path.join(dir, 'artisan'), ARTISAN, { mode: 0o755 });
   fs.writeFileSync(path.join(dir, 'public/index.php'), '<?php echo "ok";');
   fs.writeFileSync(path.join(dir, '.env'), [
-    '# production settings', 'APP_NAME="Q App"', 'APP_ENV=production', 'APP_KEY=base64:SGVsbG9UaGlzSXNOb3RSZWFsS2V5MTIzNDU2Nzg5MDEyMw==', 'APP_DEBUG=false', 'APP_URL=https://q-app.example.com',
+    '# production settings', 'APP_NAME="Q App"', 'APP_ENV="production"', 'APP_KEY=base64:SGVsbG9UaGlzSXNOb3RSZWFsS2V5MTIzNDU2Nzg5MDEyMw==', "APP_DEBUG='false'", 'APP_URL=https://q-app.example.com',
     '', 'DB_CONNECTION=mysql', 'DB_PASSWORD=super-secret-db-password', 'QUEUE_CONNECTION=database', 'SESSION_DRIVER=file', 'CACHE_STORE=file', '',
   ].join('\n'), { mode: 0o640 });
   fs.writeFileSync(path.join(dir, 'storage/logs/laravel.log'), '[2026-11-27 10:00:00] production.INFO: boot\n[2026-11-27 10:00:05] production.ERROR: SQLSTATE[HY000] connection refused\n[2026-11-27 10:00:09] production.INFO: done\n');
