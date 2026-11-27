@@ -189,6 +189,11 @@ rm -rf "$REL/"${shq(p)}; mkdir -p "$(dirname "$REL/"${shq(p)})"; ln -s "$SP" "$R
 REL="$APP_DIR/releases/${relId}"
 
 step "Preparing $APP_DIR"
+if [ -d "$APP_DIR" ] && [ ! -d "$APP_DIR/releases" ] && [ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
+  echo "!! $APP_DIR already exists and contains files that are not managed by the panel."
+  echo "   Nothing was changed. Pick another app name or folder, or use \"Add an existing app\" to adopt what is there."
+  exit 1
+fi
 if ! mkdir -p "$APP_DIR/releases" "$APP_DIR/shared" 2>/dev/null; then
   priv mkdir -p "$APP_DIR"; priv chown "$(id -un):$(id -gn)" "$APP_DIR"; mkdir -p "$APP_DIR/releases" "$APP_DIR/shared"
 fi
@@ -421,6 +426,11 @@ fi
 priv systemctl enable php-fpm
 priv systemctl restart php-fpm
 echo "PHP $(php -r 'echo PHP_VERSION;') is ready; PHP-FPM runs as the nginx user and listens on /run/php-fpm/www.sock"`);
+  }
+  if (want('awscli')) {
+    parts.push(`step "Installing the AWS CLI (for S3 backups)"
+if command -v aws >/dev/null 2>&1; then echo "AWS CLI is already installed: $(aws --version 2>&1 | head -1)"; else priv dnf -y install awscli-2 2>/dev/null || priv dnf -y install awscli; fi
+aws --version`);
   }
   if (want('mariadb')) {
     parts.push(`step "Installing MariaDB (local only)"

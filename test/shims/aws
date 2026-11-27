@@ -1,0 +1,10 @@
+#!/bin/bash
+# fake AWS CLI: "aws s3 cp <dir> s3://bucket/key/ --recursive ..." copies into $SHIM_STATE/s3/bucket/key/
+STATE="${SHIM_STATE:?}"
+[ "$1" = --version ] && { echo "aws-cli/2.99.0 (shim)"; exit 0; }
+[ "$1" = s3 ] && [ "$2" = cp ] || { echo "shim: unsupported aws $*" >&2; exit 1; }
+src="$3"; dest="${4#s3://}"
+echo "key=$AWS_ACCESS_KEY_ID region=$AWS_DEFAULT_REGION args=$*" >> "$STATE/aws.log"
+[ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || { echo "no credentials" >&2; exit 1; }
+[ -f "$STATE/aws.fail" ] && { echo "An error occurred (AccessDenied)" >&2; exit 1; }
+mkdir -p "$STATE/s3/$dest" && cp -r "$src"/. "$STATE/s3/$dest/"

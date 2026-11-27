@@ -117,6 +117,16 @@ Renewal is automatic through the `certbot-renew.timer` the panel installs (twice
 Requirements on the managed server: the SSH user needs **passwordless sudo** (default for `ec2-user`) for services, nginx and certbot; ports 80/443 open in the security group; DNS pointing at the instance (Elastic IP recommended).
 `PANEL_PHP_SOCKET` (default `unix:/run/php-fpm/www.sock`) sets the PHP-FPM socket nginx talks to. `PANEL_ENABLE_LOCAL` (managing the panel's own host with the limited sudoers rules from `--manage-local`) does not cover deploy/domains, which need broader sudo: manage hosts over SSH instead.
 
+## Databases
+
+**Databases** manages MariaDB and PostgreSQL on the server with buttons only: install, create a database (with its own user and a generated password shown once), give or remove a user's access, set a new password, export (compressed, downloadable), import (replaces the database after saving a safety copy, and restores it automatically if the file is bad), and "Use in app", which writes the connection settings into an app's `.env`/environment. Destructive actions require typing the name back.
+
+## Backups
+
+**Backups** protect databases, deployed-app data and any folder. A job lists what to save, when (hourly/daily/weekly or only on demand) and how many backups to keep; optionally each backup is also copied to Amazon S3 (install the AWS CLI with one click). Schedules are systemd timers created on the server, so they run even when the panel is closed; every run writes a manifest that the panel reads back. Restore a database in place (safety copy first, automatic rollback), unpack files into a separate folder, or overwrite in place (current files are saved first). S3 secrets are stored encrypted and live on the server only in a root-only file.
+
+Apps can be placed in `/var/www`, `/srv/apps` or any other folder when you create them; a folder that already contains files the panel did not create is never deployed into.
+
 ## Install the panel on Amazon Linux 2023
 
 ```bash

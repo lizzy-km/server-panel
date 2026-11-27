@@ -508,7 +508,7 @@ echo "indexOk=$([ -f ${shq(dir + '/live/index.html')} ] || [ -f ${shq(dir + '/li
     };
   }
 
-  static get INSTALLABLE() { return ['git', 'node', 'java', 'maven', 'dotnet', 'go', 'python', 'php', 'php82', 'php84', 'composer', 'nginx', 'certbot', 'mariadb', 'postgresql']; }
+  static get INSTALLABLE() { return ['git', 'node', 'java', 'maven', 'dotnet', 'go', 'python', 'php', 'php82', 'php84', 'composer', 'nginx', 'certbot', 'mariadb', 'postgresql', 'awscli']; }
 
   async install(serverId, tools, user, { replacePhp = false } = {}) {
     const allowed = DeployManager.INSTALLABLE;

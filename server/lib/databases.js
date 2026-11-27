@@ -283,16 +283,25 @@ echo "$(stat -c %s "$1")"
     req.on('error', (e) => counter.destroy(e));
     try { await host.fs.writeFrom(tmp, req.pipe(counter)); } catch (e) { await host.fs.rm(tmp).catch(() => {}); throw e; }
     try {
-      const safety = await this.exportDatabase(serverId, { engine, name: db }).catch(() => null);
-      const run = (file, isGz) => host.run('bash', ['-s'], { stdin: DatabaseManager.restoreScript(engine, db, file, isGz, host.useSudo), timeout: 1800000 });
-      const r = await run(tmp, gz);
-      if (!r.ok) {
-        // put the previous contents back so a bad file never leaves the database empty or half-loaded
-        const back = safety ? await run(safety.path, true) : null;
-        throw httpError(400, `Import failed: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' ')}. ${safety ? (back && back.ok ? 'The database was restored to its previous contents.' : `The previous contents are saved as ${safety.file}.`) : 'No safety copy could be made.'}`);
-      }
-      return { ok: true, bytes: size, safetyDump: safety ? safety.file : null };
+      return { ...(await this.restoreFromFile(serverId, { engine, name: db, file: tmp, gz })), bytes: size };
     } finally { await host.fs.rm(tmp).catch(() => {}); }
+  }
+
+  /** Replace a database with a dump file that is already on the server. A safety dump is taken first and put back if loading fails. */
+  async restoreFromFile(serverId, { engine, name, file, gz }) {
+    checkEngine(engine);
+    const db = checkName('Database', name);
+    if (ENGINES[engine].systemDbs.includes(db.toLowerCase())) throw httpError(400, 'System databases cannot be replaced');
+    const host = this.hostOf(serverId);
+    const safety = await this.exportDatabase(serverId, { engine, name: db }).catch(() => null);
+    const run = (f, isGz) => host.run('bash', ['-s'], { stdin: DatabaseManager.restoreScript(engine, db, f, isGz, host.useSudo), timeout: 1800000 });
+    const r = await run(file, gz);
+    if (!r.ok) {
+      // put the previous contents back so a bad file never leaves the database empty or half-loaded
+      const back = safety ? await run(safety.path, true) : null;
+      throw httpError(400, `Import failed: ${(r.stderr || r.stdout).trim().split('\n').slice(-3).join(' ')}. ${safety ? (back && back.ok ? 'The database was restored to its previous contents.' : `The previous contents are saved as ${safety.file}.`) : 'No safety copy could be made.'}`);
+    }
+    return { ok: true, safetyDump: safety ? safety.file : null };
   }
 
   /** Drop and recreate a database, then load a .sql(.gz) file into it. */

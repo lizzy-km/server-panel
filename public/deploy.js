@@ -67,6 +67,24 @@ function phpSwitchBox(needs, installed, onStarted) {
 }
 
 /** Live log viewer for a deploy (id) or a provisioning job; polls until finished. */
+/** Where on the server the app lives: /var/www (web root) or /srv/apps, or any other folder. */
+function locationField(baseDir, nameInput) {
+  const known = ['/var/www', '/srv/apps'];
+  const sel = h('select', {}, known.map((p) => h('option', { value: p }, p)), h('option', { value: '' }, 'Another folder…'));
+  const custom = h('input', { placeholder: '/opt/sites', class: 'hidden' });
+  const preview = h('div', { class: 'muted', style: { fontSize: '12px' } });
+  let last = ''; try { last = localStorage.getItem('app.baseDir') || ''; } catch { /* ignore */ }
+  sel.value = known.includes(last) ? last : '/var/www';
+  const sync = () => {
+    custom.classList.toggle('hidden', sel.value !== '');
+    baseDir.value = (sel.value || custom.value.trim() || '/var/www').replace(/\/+$/, '');
+    preview.textContent = `The app will be created in ${baseDir.value}/${nameInput.value.trim() || '<name>'}`;
+    try { if (known.includes(sel.value)) localStorage.setItem('app.baseDir', sel.value); } catch { /* ignore */ }
+  };
+  sel.onchange = sync; custom.oninput = sync; nameInput.addEventListener('input', sync); sync();
+  return h('div', { class: 'field' }, h('label', {}, 'Location on the server'), sel, custom, preview);
+}
+
 function logModal(title, { url, onDone }) {
   const pre = h('pre', { class: 'out', style: { minHeight: '40vh' } }, '');
   const badge = h('span', {}, '');
@@ -270,14 +288,14 @@ function appForm(app, apps, presets, tools) {
       h('div', { class: 'row', style: { margin: '0 0 10px' } }, detectBtn, detectMsg), detectBox) : h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox),
     h('div', { class: 'field' }, h('label', {}, isNew ? 'Framework' : 'Framework (fixed after creation)'), picker), info, isNew ? req : '',
     modeFields,
-    isNew ? h('div', { class: 'grid2' }, field('App name', f.name, 'Lowercase letters, digits, dashes'), h('div', {})) : '',
+    isNew ? h('div', { class: 'grid2' }, field('App name', f.name, 'Lowercase letters, digits, dashes'), locationField(f.baseDir, f.name)) : '',
     cmds,
     h('details', { class: 'adv' }, h('summary', {}, 'Advanced: health check, releases, user'),
       h('div', { class: 'grid2' }, field('Health check path', f.healthPath), field('Wait up to (seconds)', f.healthTimeout)),
       field('Health check host name (PHP apps)', f.healthHost, 'PHP apps are checked through nginx on port 80 with this host name. Leave empty to only check that the site files exist.'),
       h('label', { class: 'row', style: { margin: '4px 0 12px' } }, f.healthStrict, 'Require a 2xx/3xx answer (otherwise anything below 500 counts as healthy)'),
       h('div', { class: 'grid2' }, field('Releases to keep', f.keepReleases), field('Run as Linux user', f.runAs)),
-      h('div', { class: 'grid2' }, field('Apps directory', f.baseDir), field('Extra PATH', f.extraPath))),
+      h('div', { class: 'grid2' }, isNew ? h('div', {}) : field('Apps directory', f.baseDir), field('Extra PATH', f.extraPath))),
     isNew ? field('Environment variables (optional)', f.env, 'One NAME=value per line. Stored encrypted; values are never shown again unless an admin reveals them.') : null);
   refresh();
 

@@ -82,7 +82,7 @@ async function makeTarget() {
     le: path.join(dir, 'letsencrypt'), acme: path.join(dir, 'acme'), tmp: path.join(dir, 'nginx/tmp'),
   };
   for (const d of [bin, state, ...Object.values(dirs)]) fs.mkdirSync(d, { recursive: true });
-  for (const name of ['systemctl', 'journalctl', 'certbot']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(bin, name)), fs.chmodSync(path.join(bin, name), 0o755);
+  for (const name of ['systemctl', 'journalctl', 'certbot', 'aws']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(bin, name)), fs.chmodSync(path.join(bin, name), 0o755);
   const nginxConf = path.join(dir, 'nginx/nginx.conf');
   fs.writeFileSync(nginxConf, `pid ${dir}/nginx/nginx.pid;\nerror_log ${dirs.logs}/error.log;\nevents { worker_connections 16; }\nhttp {\n  access_log off;\n  client_body_temp_path ${dirs.tmp}/b; proxy_temp_path ${dirs.tmp}/p; fastcgi_temp_path ${dirs.tmp}/f; uwsgi_temp_path ${dirs.tmp}/u; scgi_temp_path ${dirs.tmp}/s;\n  include ${dirs.conf}/*.conf;\n}\n`);
   // `include fastcgi_params;` is resolved relative to the test nginx.conf

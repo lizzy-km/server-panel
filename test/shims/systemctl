@@ -11,7 +11,7 @@ case "$cmd" in
   daemon-reload|enable|disable|reset-failed) exit 0;;
   is-enabled) echo enabled;;
   is-active)
-    if [ "$unit" = nginx ] || [ "$unit" = certbot-renew.timer ]; then
+    if [ "$unit" = nginx ] || [[ "$unit" == *.timer ]]; then
       if [ -f "$STATE/$unit.active" ]; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi
     fi
     if active "$unit"; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi;;
@@ -22,12 +22,12 @@ case "$cmd" in
       *MemoryCurrent*) echo 12345678;;
       *NRestarts*) echo 0;;
     esac;;
-  stop) stop_unit "$unit"; rm -f "$STATE/$unit.active";;
+  stop) case "$unit" in *.timer) rm -f "$STATE/$unit.active"; exit 0;; esac; stop_unit "$unit"; rm -f "$STATE/$unit.active";;
   reload)
     echo "reload $unit" >> "$STATE/reloads.log"
     if [ "$unit" = nginx ]; then echo x >> "$STATE/nginx.reloads"; [ -f "$STATE/nginx.active" ] || exit 1; exit 0; fi; exit 0;;
   start|restart)
-    if [ "$unit" = nginx ] || [ "$unit" = certbot-renew.timer ]; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi
+    if [ "$unit" = nginx ] || [[ "$unit" == *.timer ]]; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi
     f="$UNIT_DIR/$unit"; [ -f "$f" ] || { echo "Unit $unit not found." >&2; exit 5; }
     stop_unit "$unit"
     wd=$(sed -n 's/^WorkingDirectory=//p' "$f"); envf=$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$f"); ex=$(sed -n 's/^ExecStart=//p' "$f")

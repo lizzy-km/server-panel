@@ -14,6 +14,7 @@ const { DeployManager } = require('./lib/deploy');
 const { DomainManager } = require('./lib/domains');
 const { LaravelManager } = require('./lib/laravel');
 const { DatabaseManager } = require('./lib/databases');
+const { BackupManager } = require('./lib/backups');
 const { summarizeFile } = require('./lib/nginxparse');
 const { readBody } = require('./lib/http');
 
@@ -43,6 +44,7 @@ function createApp(overrides = {}) {
   const domains = new DomainManager({ store, servers, deploy, config });
   const laravel = new LaravelManager({ store, servers, config });
   const databases = new DatabaseManager({ servers, config });
+  const backups = new BackupManager({ store, vault, servers, config, databases, deploy });
   // an app's port changed and a deploy has made the new port live: repoint nginx sites that proxy to it
   deploy.onPortChanged = async (app) => {
     for (const site of domains.sites.filter((x) => x.serverId === app.serverId && x.upstream.type === 'app' && x.upstream.appId === app.id)) {
@@ -618,6 +620,61 @@ function createApp(overrides = {}) {
     deploy.setEnv(app.id, vars);
     note(ctx, 'db_use_in_app', `${b.engine}:${vars.DB_DATABASE} -> ${app.name}`);
     return { ok: true, target: app.name, redeploy: true };
+  });
+
+  // --- backups (scheduled by systemd timers on the server itself), admin only ---
+  const jobOf = (ctx, id) => { const j = backups.find(id); if (j.serverId !== ctx.srv.id) throw httpError(404, 'Unknown backup job on this server'); return j; };
+  scoped('GET', '/api/backups', 'admin', async (ctx) => {
+    const jobs = await Promise.all(backups.forServer(ctx.srv.id).map(async (j) => ({ ...backups.publicJob(j), timer: await backups.timerState(j).catch(() => ({ scheduled: j.schedule.kind !== 'manual', active: false })), last: await backups.runs(j.id).then((r) => r[0] || null).catch(() => null) })));
+    return { jobs, s3: await backups.s3Check(ctx.srv.id).catch(() => ({ installed: false })), defaults: { root: config.backupRoot } };
+  });
+  scoped('POST', '/api/backups', 'admin', async (ctx) => {
+    const j = await backups.create(ctx.srv.id, await readJson(ctx.req), ctx.user.username);
+    note(ctx, 'backup_create', j.name);
+    return { job: backups.publicJob(j) };
+  });
+  scoped('POST', '/api/backups/update', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    jobOf(ctx, b.id);
+    const j = await backups.update(b.id, b);
+    note(ctx, 'backup_update', j.name);
+    return { job: backups.publicJob(j) };
+  });
+  scoped('DELETE', '/api/backups', 'admin', async (ctx) => {
+    const j = jobOf(ctx, q(ctx, 'id'));
+    await backups.remove(j.id, { deleteFiles: q(ctx, 'deleteFiles') === '1' });
+    note(ctx, 'backup_delete', `${j.name}${q(ctx, 'deleteFiles') === '1' ? ' (and its backup files)' : ''}`);
+    return { ok: true };
+  });
+  scoped('POST', '/api/backups/run', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const j = jobOf(ctx, b.id);
+    const r = await backups.run(j.id, ctx.user.username);
+    note(ctx, 'backup_run', j.name);
+    return r;
+  });
+  scoped('GET', '/api/backups/runs', 'admin', async (ctx) => ({ runs: await backups.runs(jobOf(ctx, q(ctx, 'id')).id) }));
+  scoped('GET', '/api/backups/download', 'admin', async (ctx) => {
+    const j = jobOf(ctx, q(ctx, 'id'));
+    const d = await backups.download(j.id, q(ctx, 'run'), q(ctx, 'file'));
+    note(ctx, 'backup_download', d.name);
+    ctx.res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Length': d.size, 'Content-Disposition': `attachment; filename="${d.name}"` });
+    d.stream.on('error', () => ctx.res.destroy());
+    d.stream.pipe(ctx.res);
+    return undefined;
+  });
+  scoped('DELETE', '/api/backups/runs', 'admin', async (ctx) => {
+    const j = jobOf(ctx, q(ctx, 'id'));
+    await backups.removeRun(j.id, q(ctx, 'run'));
+    note(ctx, 'backup_run_delete', `${j.name} ${q(ctx, 'run')}`);
+    return { ok: true };
+  });
+  scoped('POST', '/api/backups/restore', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const j = jobOf(ctx, b.id);
+    const r = await backups.restore(j.id, b);
+    note(ctx, 'backup_restore', `${j.name} ${b.run} ${b.file}${b.inPlace ? ' (in place)' : ''}`);
+    return r;
   });
 
   // --- users & audit ---
