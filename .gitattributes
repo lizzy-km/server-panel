@@ -1,2 +1,7 @@
 # Vendored dependencies must stay byte-for-byte identical (no CRLF conversion on Windows).
 node_modules/** -text
+
+# Launchers must keep the line endings their shell requires, whatever the checkout settings.
+*.bat text eol=crlf
+*.sh text eol=lf
+*.command text eol=lf

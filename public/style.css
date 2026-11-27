@@ -168,3 +168,13 @@ details.adv { margin: 4px 0 12px; } details.adv summary { cursor: pointer; color
 @media (max-width: 600px) { .grid2, .kv { grid-template-columns: 1fr; } }
 .spin { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; margin-right: 6px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* framework picker */
+.fw-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin: 6px 0 12px; }
+.fw-group { grid-column: 1 / -1; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; margin-top: 6px; }
+.fw-card { text-align: left; display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 10px; background: var(--panel); }
+.fw-card .ic { font-size: 22px; line-height: 1; }
+.fw-card .t { font-weight: 650; font-size: 13px; }
+.fw-card .m { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.fw-card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; background: var(--panel2); }
+.req { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 12px; }

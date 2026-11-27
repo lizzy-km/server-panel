@@ -6,6 +6,7 @@ const { httpError, safeEq } = require('./auth');
 const { shq } = require('./host');
 const { Runner } = require('./runner');
 const S = require('./scripts');
+const P = require('./presets');
 
 const NAME_RE = /^[a-z][a-z0-9-]{1,31}$/;
 const REF_RE = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/;
@@ -89,10 +90,34 @@ class DeployManager {
       if (!/^[A-Za-z0-9._@-]{1,64}$/.test(String(input.tokenUser))) throw httpError(400, 'Invalid token username');
       out.tokenUser = String(input.tokenUser);
     }
-    for (const [k, label] of [['installCmd', 'Install command'], ['buildCmd', 'Build command'], ['startCmd', 'Start command']]) {
+    if (!partial || has('framework')) {
+      const f = String(input.framework || 'node');
+      if (!P.BY_ID[f]) throw httpError(400, `Unknown framework "${f}"`);
+      out.framework = f;
+    }
+    for (const [k, label] of [['installCmd', 'Install command'], ['buildCmd', 'Build command'], ['startCmd', 'Start command'], ['releaseCmd', 'Release command'], ['afterCmd', 'After-deploy command']]) {
       if (has(k)) out[k] = cmd(input[k], label);
     }
-    if (!partial || has('port')) {
+    if (has('outputDir')) {
+      const o = String(input.outputDir || '').trim();
+      if (o && o !== 'auto' && (!/^[A-Za-z0-9._/@-]{1,120}$/.test(o) || o.includes('..') || o.startsWith('/'))) throw httpError(400, 'Output folder must be a relative path such as dist or build/web');
+      out.outputDir = o;
+    }
+    if (has('sharedPaths')) {
+      const list = (Array.isArray(input.sharedPaths) ? input.sharedPaths : String(input.sharedPaths || '').split(/[\s,]+/)).map((x) => String(x).trim()).filter(Boolean);
+      for (const x of list) if (!/^[A-Za-z0-9._][A-Za-z0-9._/-]{0,100}$/.test(x) || x.split('/').includes('..') || x.startsWith('/') || x === '.') throw httpError(400, `Invalid shared folder: ${x}`);
+      out.sharedPaths = list.slice(0, 20);
+    }
+    if (has('healthHost')) {
+      const hh = String(input.healthHost || '').trim();
+      if (hh && !/^[A-Za-z0-9.-]{1,253}$/.test(hh)) throw httpError(400, 'Invalid health check host name');
+      out.healthHost = hh;
+    }
+    if (has('spa')) out.spa = !!input.spa;
+    // the framework decides whether this app is a service on a port (service) or served by nginx (static, php)
+    const framework = out.framework || (partial && selfId ? (this.apps.find((a) => a.id === selfId) || {}).framework : 'node') || 'node';
+    const mode = (P.BY_ID[framework] || P.BY_ID.node).mode;
+    if (mode === 'service' && (!partial || has('port'))) {
       const port = Number(input.port);
       if (!Number.isInteger(port) || port < 1024 || port > 65535) throw httpError(400, 'Port must be between 1024 and 65535');
       if (this.apps.some((a) => a.serverId === serverId && a.id !== selfId && a.port === port)) throw httpError(409, `Port ${port} is already used by another app on this server`);
@@ -138,6 +163,8 @@ class DeployManager {
     const last = this.store.data.deploys.find((d) => d.appId === app.id);
     const o = {
       id: app.id, serverId: app.serverId, name: app.name, unit: app.unit, repoUrl: app.repoUrl, branch: app.branch,
+      framework: app.framework || 'node', mode: P.resolve(app).mode, outputDir: app.outputDir || '', sharedPaths: app.sharedPaths || null, releaseCmd: app.releaseCmd ?? null, afterCmd: app.afterCmd ?? null, healthHost: app.healthHost || '', spa: P.resolve(app).spa,
+      effective: (() => { const c = P.resolve(app); return { install: c.install, build: c.build, start: c.start, outputDir: c.outputDir, sharedPaths: c.sharedPaths, releaseCmd: c.releaseCmd, afterCmd: c.afterCmd }; })(),
       authType: app.authType, tokenUser: app.tokenUser || 'x-access-token', hasGitSecret: !!app.secretEnc,
       installCmd: app.installCmd || '', buildCmd: app.buildCmd || '', startCmd: app.startCmd || '', port: app.port,
       healthPath: app.healthPath || '/', healthTimeout: app.healthTimeout || 30, healthStrict: !!app.healthStrict,
@@ -155,8 +182,9 @@ class DeployManager {
     const v = this.clean(input, { serverId });
     if (this.apps.some((a) => a.serverId === serverId && a.name === v.name)) throw httpError(409, 'An app with that name already exists on this server');
     const app = {
-      id: crypto.randomUUID(), serverId, ...v, unit: `panel-app-${v.name}.service`,
-      healthPath: v.healthPath || '/', healthTimeout: v.healthTimeout || 30, keepReleases: v.keepReleases || 5,
+      id: crypto.randomUUID(), serverId, ...v, framework: v.framework || 'node',
+      unit: P.BY_ID[v.framework || 'node'].mode === 'service' ? `panel-app-${v.name}.service` : '',
+      healthTimeout: v.healthTimeout || 30, keepReleases: v.keepReleases || 5,
       envEnc: null, secretEnc: null, webhookEnabled: false, webhookEnc: null,
       created: new Date().toISOString(), createdBy: user,
     };
@@ -173,6 +201,7 @@ class DeployManager {
     const app = this.find(id);
     if (this.running.has(id)) throw httpError(409, 'A deploy is running for this app');
     const v = this.clean(input, { partial: true, serverId: app.serverId, selfId: id });
+    if (v.framework && P.BY_ID[v.framework].mode !== P.resolve(app).mode) throw httpError(400, 'The framework type cannot change between service, static and PHP apps after creation. Create a new app instead.');
     if (v.name && v.name !== app.name) throw httpError(400, 'An app cannot be renamed (its service and folders are named after it); create a new app instead');
     if (v.baseDir && v.baseDir !== app.baseDir) throw httpError(400, 'The apps directory cannot be changed after creation');
     Object.assign(app, v);
@@ -229,7 +258,8 @@ class DeployManager {
     const host = this.hostFor(app);
     await host.connect();
     const env = this.envOf(app);
-    const script = S.envApplyScript(app, { appDir: this.appDir(app), useSudo: host.useSudo, unitDir: this.config.unitDir, envFile: S.envFileText(env), envShell: S.envShellText(env) });
+    const { cfg, ctx } = this.ctxFor(app, host, { envFile: S.envFileText(env), envShell: S.envShellText(env) });
+    const script = S.envApplyScript(app, cfg, ctx);
     const r = await host.run('bash', ['-s'], { stdin: script, timeout: 180000 });
     const output = (r.stdout + r.stderr).split('\n').filter((l) => !l.startsWith('@@')).join('\n').trim();
     if (!/@@STATE ok/.test(r.stdout)) throw Object.assign(httpError(400, output.split('\n').slice(-4).join('\n') || 'Applying the environment failed'), { output });
@@ -265,12 +295,25 @@ class DeployManager {
     d.deploys = d.deploys.filter((x) => x.serverId !== serverId);
     d.apps = d.apps.filter((x) => x.serverId !== serverId);
     d.sites = d.sites.filter((x) => x.serverId !== serverId);
+    d.laravel = (d.laravel || []).filter((x) => x.serverId !== serverId);
     this.store.save();
   }
 
   // ------------------------------------------------------------------ deploy / rollback
 
   hostFor(app) { return this.servers.entry(app.serverId).host; }
+
+  /** Everything the scripts need besides the app itself. */
+  ctxFor(app, host, extra = {}) {
+    const cfg = P.resolve(app);
+    return {
+      cfg,
+      ctx: {
+        appDir: this.appDir(app), useSudo: host.useSudo, unitDir: this.config.unitDir, allowLocalRepos: this.config.allowLocalRepos,
+        appUser: app.runAs || (cfg.mode === 'php' ? 'nginx' : ''), fpmUnit: app.fpmUnit || 'php-fpm.service', ...extra,
+      },
+    };
+  }
   serviceUser(app, host) { return app.runAs || host.username || os.userInfo().username; }
 
   record(rec) {
@@ -291,7 +334,7 @@ class DeployManager {
       // The new port is live now: repoint nginx sites BEFORE reporting success, so "success" means everything is consistent.
       const app = this.apps.find((a) => a.id === rec.appId);
       if (app) {
-        const moved = app.livePort !== undefined && app.livePort !== app.port;
+        const moved = P.resolve(app).mode === 'service' && app.livePort !== undefined && app.livePort !== app.port;
         app.livePort = app.port;
         if (moved && this.onPortChanged) {
           try { await this.onPortChanged(app); this.runner.append(rec.id, `\n==> Domains repointed to port ${app.port}\n`); } catch (e) { this.runner.append(rec.id, `\n!! Could not repoint domains to port ${app.port}: ${e.message}\n`); }
@@ -315,13 +358,12 @@ class DeployManager {
     const id = crypto.randomUUID();
     const relId = new Date().toISOString().replace(/\D/g, '').slice(0, 14) + '-' + crypto.randomBytes(2).toString('hex');
     const appDir = this.appDir(app);
-    const script = S.deployScript(app, {
-      appDir, relId, ref: refName, useSudo: host.useSudo, unitDir: this.config.unitDir, allowLocalRepos: this.config.allowLocalRepos,
-      secrets: { gitSecret: app.secretEnc ? this.vault.decrypt(app.secretEnc) : '' },
-      envFile: S.envFileText(env), envShell: S.envShellText(env),
-      startSh: S.startScript(app, appDir), unit: S.unitText(app, appDir, this.serviceUser(app, host)),
-      repoLabel: app.repoUrl.replace(/\/\/[^@/]*@/, '//'),
+    const { cfg, ctx } = this.ctxFor(app, host, {
+      relId, ref: refName, secrets: { gitSecret: app.secretEnc ? this.vault.decrypt(app.secretEnc) : '' },
+      envFile: S.envFileText(env), envShell: S.envShellText(env), repoLabel: app.repoUrl.replace(/\/\/[^@/]*@/, '//'),
     });
+    if (cfg.mode === 'service') { ctx.startSh = S.startScript(app, cfg, appDir); ctx.unit = S.unitText(app, appDir, this.serviceUser(app, host)); }
+    const script = S.deployScript(app, cfg, ctx);
     const rec = this.record({ id, kind: 'deploy', appId, appName: app.name, serverId: app.serverId, status: 'running', trigger, user, ref: refName, release: relId, commit: null, message: null, startedAt: new Date().toISOString(), finishedAt: null });
     this.running.set(appId, id);
     this.runner.run({ id, host, script, timeout: 30 * 60 * 1000 }).then((r) => this.finish(rec, r), (e) => { console.error('[deploy] runner error', e); return this.finish(rec, { code: 1, markers: {} }); });
@@ -335,7 +377,8 @@ class DeployManager {
     const host = this.hostFor(app);
     await host.connect();
     const id = crypto.randomUUID();
-    const script = S.rollbackScript(app, { appDir: this.appDir(app), release, useSudo: host.useSudo, unitDir: this.config.unitDir });
+    const { cfg, ctx } = this.ctxFor(app, host, { release });
+    const script = S.rollbackScript(app, cfg, ctx);
     const rec = this.record({ id, kind: 'rollback', appId, appName: app.name, serverId: app.serverId, status: 'running', trigger: 'manual', user, ref: null, release, commit: null, message: `Rollback to ${release}`, startedAt: new Date().toISOString(), finishedAt: null });
     this.running.set(appId, id);
     this.runner.run({ id, host, script, timeout: 10 * 60 * 1000 }).then((r) => this.finish(rec, r), () => this.finish(rec, { code: 1, markers: {} }));
@@ -369,25 +412,33 @@ done`], { timeout: 15000 });
 
   async status(app) {
     const host = this.hostFor(app);
-    const u = shq(app.unit);
-    const r = await host.run('sh', ['-c', `echo "active=$(systemctl is-active ${u} 2>/dev/null)"
+    const cfg = P.resolve(app);
+    const dir = this.appDir(app);
+    const u = shq(app.unit || 'none');
+    const r = await host.run('sh', ['-c', `${cfg.mode === 'service' ? `echo "active=$(systemctl is-active ${u} 2>/dev/null)"
 echo "enabled=$(systemctl is-enabled ${u} 2>/dev/null)"
 echo "since=$(systemctl show -p ActiveEnterTimestamp --value ${u} 2>/dev/null)"
 echo "pid=$(systemctl show -p MainPID --value ${u} 2>/dev/null)"
 echo "memory=$(systemctl show -p MemoryCurrent --value ${u} 2>/dev/null)"
-echo "restarts=$(systemctl show -p NRestarts --value ${u} 2>/dev/null)"
-echo "current=$(readlink ${shq(this.appDir(app) + '/current')} 2>/dev/null)"`], { timeout: 15000 });
+echo "restarts=$(systemctl show -p NRestarts --value ${u} 2>/dev/null)"` : ''}
+echo "current=$(readlink ${shq(dir + '/current')} 2>/dev/null)"
+echo "live=$(readlink ${shq(dir + '/live')} 2>/dev/null)"
+echo "indexOk=$([ -f ${shq(dir + '/live/index.html')} ] || [ -f ${shq(dir + '/live/index.php')} ] && echo 1 || echo 0)"`], { timeout: 15000 });
     const o = {};
     for (const line of r.stdout.split('\n')) { const i = line.indexOf('='); if (i > 0) o[line.slice(0, i)] = line.slice(i + 1).trim(); }
+    const deployed = !!o.current;
     return {
-      active: o.active || 'unknown', enabled: o.enabled || 'unknown', since: o.since || '', pid: Number(o.pid) || null,
+      mode: cfg.mode,
+      active: cfg.mode === 'service' ? (o.active || 'unknown') : (deployed ? (o.indexOk === '1' ? 'serving' : 'broken') : 'not deployed'),
+      enabled: o.enabled || '', since: o.since || '', pid: Number(o.pid) || null,
       memory: /^\d+$/.test(o.memory || '') ? Number(o.memory) : null, restarts: Number(o.restarts) || 0,
-      currentRelease: o.current ? path.posix.basename(o.current) : null,
+      currentRelease: o.current ? path.posix.basename(o.current) : null, serving: o.live || null,
     };
   }
 
   async service(app, action) {
     if (!['start', 'stop', 'restart'].includes(action)) throw httpError(400, 'Invalid action');
+    if (P.resolve(app).mode !== 'service') throw httpError(400, 'This app has no process of its own: it is served directly by nginx / PHP-FPM.');
     const host = this.hostFor(app);
     const r = await host.runPriv('systemctl', [action, app.unit], { timeout: 60000 });
     if (!r.ok) throw httpError(500, (r.stderr || r.stdout || 'systemctl failed').trim());
@@ -395,6 +446,7 @@ echo "current=$(readlink ${shq(this.appDir(app) + '/current')} 2>/dev/null)"`], 
   }
 
   async serviceLogs(app, lines = 200) {
+    if (P.resolve(app).mode !== 'service') throw httpError(400, 'Static and PHP apps have no service log; see the domain\'s access and error logs instead.');
     const host = this.hostFor(app);
     const n = Math.max(1, Math.min(2000, Number(lines) || 200));
     const r = await host.runPriv('journalctl', ['-u', app.unit, '-n', String(n), '--no-pager', '-o', 'short-iso'], { timeout: 20000 });
@@ -443,25 +495,48 @@ echo "current=$(readlink ${shq(this.appDir(app) + '/current')} 2>/dev/null)"`], 
   // ------------------------------------------------------------------ server provisioning
 
   async toolsStatus(host) {
-    const r = await host.run('sh', ['-c', S.TOOLS_CHECK], { timeout: 20000 });
+    const r = await host.run('sh', ['-c', S.TOOLS_CHECK], { timeout: 25000 });
     const o = {};
     for (const line of r.stdout.split('\n')) { const i = line.indexOf('='); if (i > 0) o[line.slice(0, i)] = line.slice(i + 1).trim(); }
     const tool = (n) => ({ installed: !!o[n] && o[n] !== 'missing', version: o[n] && o[n] !== 'missing' ? o[n] : '' });
     return {
-      tools: { git: tool('git'), node: tool('node'), npm: tool('npm'), nginx: tool('nginx'), certbot: tool('certbot'), curl: tool('curl'), openssl: tool('openssl') },
-      nginxActive: o.nginx_active === 'active', certbotTimer: o.certbot_timer === 'active', user: o.user || '', sudo: o.sudo || 'no',
+      tools: { git: tool('git'), node: tool('node'), npm: tool('npm'), nginx: tool('nginx'), certbot: tool('certbot'), curl: tool('curl'), openssl: tool('openssl'),
+        java: tool('java'), maven: tool('mvn'), dotnet: tool('dotnet'), php: tool('php'), composer: tool('composer'), go: tool('go'), python: tool('python3') },
+      nginxActive: o.nginx_active === 'active', certbotTimer: o.certbot_timer === 'active', fpmUnit: o.fpm_unit || '', fpmUser: o.fpm_user || '',
+      user: o.user || '', sudo: o.sudo || 'no',
     };
   }
 
+  static get INSTALLABLE() { return ['git', 'node', 'java', 'maven', 'dotnet', 'go', 'python', 'php', 'composer', 'nginx', 'certbot']; }
+
   async install(serverId, tools, user) {
-    const allowed = ['git', 'node', 'nginx', 'certbot'];
+    const allowed = DeployManager.INSTALLABLE;
     if (!Array.isArray(tools) || !tools.length || !tools.every((t) => allowed.includes(t))) throw httpError(400, `tools must be a non-empty subset of ${allowed.join(', ')}`);
     const e = this.servers.entry(serverId);
     await e.host.connect();
     const id = crypto.randomUUID();
-    const script = S.installScript(tools, { useSudo: e.host.useSudo, acmeRoot: this.config.acmeRoot, unitDir: this.config.unitDir });
-    this.runner.run({ id, host: e.host, script, timeout: 20 * 60 * 1000 }).catch(() => {});
+    // composer needs PHP, and PHP-FPM needs nginx's user: keep a sensible order
+    const order = allowed.filter((t) => tools.includes(t));
+    const script = S.installScript(order, { useSudo: e.host.useSudo, acmeRoot: this.config.acmeRoot, unitDir: this.config.unitDir });
+    this.runner.run({ id, host: e.host, script, timeout: 30 * 60 * 1000 }).catch(() => {});
     return { id, user };
+  }
+
+  /** Clone the repository on the server (shallow, temp folder) and say which framework preset fits. */
+  async detect(serverId, input) {
+    const e = this.servers.entry(serverId);
+    const host = e.host;
+    await host.connect();
+    const v = this.clean({ ...input, name: 'detect', framework: 'static-html' }, { serverId }); // a portless type: only the repository details are validated here
+    const secrets = { gitSecret: v.authType !== 'none' && input.gitSecret ? String(input.gitSecret) : '' };
+    if (v.authType !== 'none' && !secrets.gitSecret) throw httpError(400, 'Provide the token / deploy key to look inside a private repository');
+    const script = S.detectRepoScript({ repoUrl: v.repoUrl, authType: v.authType, tokenUser: v.tokenUser }, { ref: v.branch, secrets, allowLocalRepos: this.config.allowLocalRepos });
+    const r = await host.run('bash', ['-s'], { stdin: script, timeout: 120000 });
+    const err = (r.stdout.match(/@@ERROR (.*)/) || [])[1];
+    if (err) throw httpError(400, `Could not read the repository: ${err}`);
+    const id = (r.stdout.match(/@@PRESET (\S+)/) || [])[1];
+    if (!id || !P.BY_ID[id]) throw httpError(500, 'Detection failed: ' + (r.stderr || r.stdout).slice(-200));
+    return { preset: id, label: P.BY_ID[id].label, mode: P.BY_ID[id].mode };
   }
 }
 

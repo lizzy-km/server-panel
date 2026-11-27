@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { canTarget, makeStack, waitDeploy, makeRepo, freePort, get, tmp } = require('./helpers');
 const S = require('../server/lib/scripts');
 const { checkRepo } = require('../server/lib/deploy');
+const P = require('../server/lib/presets');
 
 const skip = !canTarget();
 let st, repo, port, appId, shas = {};
@@ -44,9 +45,10 @@ test('repository URLs and commands are validated (no git option or transport inj
 test('generated deploy script quotes everything and keeps secrets out of the command line', () => {
   const app = { name: 'web', unit: 'panel-app-web.service', port: 3000, healthPath: '/', repoUrl: 'https://github.com/o/r.git', authType: 'token', tokenUser: 'x-access-token', branch: 'main' };
   const evil = "tok'; touch /tmp/pwned; echo '";
-  const script = S.deployScript(app, {
+  const cfg = P.resolve({ ...app, framework: 'node' });
+  const script = S.deployScript(app, cfg, {
     appDir: '/srv/apps/web', relId: '20260101000000-abcd', ref: 'main', useSudo: true, unitDir: '/etc/systemd/system', allowLocalRepos: false,
-    secrets: { gitSecret: evil }, envFile: S.envFileText({ A: 'x"y' }), envShell: S.envShellText({ A: "it's" }), startSh: S.startScript(app, '/srv/apps/web'), unit: S.unitText(app, '/srv/apps/web', 'ec2-user'), repoLabel: 'github.com/o/r.git',
+    secrets: { gitSecret: evil }, envFile: S.envFileText({ A: 'x"y' }), envShell: S.envShellText({ A: "it's" }), startSh: S.startScript(app, cfg, '/srv/apps/web'), unit: S.unitText(app, '/srv/apps/web', 'ec2-user'), repoLabel: 'github.com/o/r.git',
   });
   assert.ok(script.includes(`'tok'\\''; touch /tmp/pwned; echo '\\'''`) || !script.includes("; touch /tmp/pwned; echo '\n"), 'secret must be shell-quoted');
   assert.match(script, /GIT_ALLOW_PROTOCOL=https:ssh\n/);
@@ -98,7 +100,7 @@ test('first deploy: clone, install, build, service, activate, health check', { s
   assert.equal(deploy.status, 'success', log);
   assert.equal(deploy.commit, shas.v1);
   assert.equal(deploy.message, 'version 1');
-  for (const step of ['==> Cloning', '==> Installing dependencies', '==> Building', '==> Configuring service', '==> Activating release', '==> Health check', 'healthy']) assert.ok(log.includes(step), `log has "${step}"`);
+  for (const step of ['==> Cloning', '==> Installing dependencies', '==> Building', '==> Configuring service', '==> Going live', '==> Health check', 'healthy']) assert.ok(log.includes(step), `log has "${step}"`);
   assert.ok(!log.includes('@@'), 'machine markers are not shown in the log');
   assert.equal(await get(port), 'hello 1');
   assert.equal(await get(port, '/env'), 'hi there', 'environment variables reach the app');

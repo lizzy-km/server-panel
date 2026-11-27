@@ -24,6 +24,7 @@ case "$cmd" in
     esac;;
   stop) stop_unit "$unit"; rm -f "$STATE/$unit.active";;
   reload)
+    echo "reload $unit" >> "$STATE/reloads.log"
     if [ "$unit" = nginx ]; then echo x >> "$STATE/nginx.reloads"; [ -f "$STATE/nginx.active" ] || exit 1; exit 0; fi; exit 0;;
   start|restart)
     if [ "$unit" = nginx ] || [ "$unit" = certbot-renew.timer ]; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi

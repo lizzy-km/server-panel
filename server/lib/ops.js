@@ -240,7 +240,7 @@ class LogReader {
     const n = Math.max(1, Math.min(5000, Number(lines) || 300));
     const r = await this.host.runPriv('tail', ['-c', String(2 * 1024 * 1024), '--', real], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
     if (!r.ok) throw httpError(/denied/i.test(r.stderr) ? 403 : 500, r.stderr.trim() || 'Could not read log file');
-    return { output: filterLines(r.stdout, q).split('\n').slice(-n).join('\n') };
+    return { output: filterLines(r.stdout, q).replace(/\n+$/, '').split('\n').slice(-n).join('\n') };
   }
 
   async journal({ unit, lines = 300, priority, q } = {}) {

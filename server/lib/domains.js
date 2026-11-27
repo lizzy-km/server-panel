@@ -5,6 +5,8 @@ const net = require('net');
 const { httpError } = require('./auth');
 const { shq } = require('./host');
 const { dnsReport, httpReport } = require('./netcheck');
+const { summarizeFile } = require('./nginxparse');
+const P = require('./presets');
 
 const HOST_RE = /^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const URL_RE = /^https?:\/\/[A-Za-z0-9.\-]+(:\d{1,5})?(\/[A-Za-z0-9._~/%-]*)?$/;
@@ -76,6 +78,7 @@ function renderNginx(site, ctx) {
   const v6 = ctx.ipv6 !== false;
   const cert = tls ? `${ctx.letsencryptDir}/live/${site.tls.certName}` : null;
   const up = site.upstream;
+  const app = ctx.app && (ctx.app.mode === 'static' || ctx.app.mode === 'php') ? ctx.app : null; // {mode, root, spa, fastcgi}
   const body = up.type === 'static'
     ? `        root ${up.root};\n        index index.html;\n        try_files $uri ${up.spa ? '/index.html' : '$uri/ =404'};`
     : `        proxy_pass ${ctx.upstreamUrl};
@@ -90,8 +93,9 @@ function renderNginx(site, ctx) {
   const custom = (site.customConfig || '').trim()
     ? `\n    # ---- custom configuration ----\n${site.customConfig.trim().split('\n').map((l) => '    ' + l).join('\n')}\n`
     : '';
+  const rootLines = app ? `    root ${app.root};\n    index ${app.mode === 'php' ? 'index.php index.html' : 'index.html'};\n` : '';
   const common = `    server_name ${names};
-    client_max_body_size ${site.maxBodyMb || 10}m;
+${rootLines}    client_max_body_size ${site.maxBodyMb || 10}m;
     access_log ${ctx.logDir}/${site.domain}.access.log;
     error_log ${ctx.logDir}/${site.domain}.error.log;
 ${custom}`;
@@ -99,7 +103,29 @@ ${custom}`;
         root ${ctx.acmeRoot};
         default_type "text/plain";
     }`;
-  const proxyLocation = `    location / {\n${body}\n    }`;
+  const appLocations = !app ? null : app.mode === 'php'
+    ? `    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }
+    location ~ \\.php$ {
+        fastcgi_pass ${app.fastcgi};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+        fastcgi_read_timeout 120s;
+    }
+    location ~ /\\.(?!well-known) {
+        deny all;
+    }`
+    : `    location / {
+        try_files $uri ${app.spa ? '/index.html' : '$uri/ =404'};
+    }
+    location ~* \\.(?:css|js|mjs|woff2?|ttf|svg|png|jpe?g|gif|webp|ico)$ {
+        expires 7d;
+        add_header Cache-Control "public";
+        try_files $uri =404;
+    }`;
+  const proxyLocation = appLocations || `    location / {\n${body}\n    }`;
 
   let out = `# Managed by Server Panel (site ${site.id}). Edit it in the panel; manual changes are overwritten.\n`;
   if (!tls) {
@@ -134,7 +160,7 @@ class DomainManager {
     return s;
   }
 
-  confPath(site) { return `${this.config.nginxConfDir}/panel-${site.domain}.conf`; }
+  confPath(site) { return `${this.config.nginxConfDir}/${site.confFile || `panel-${site.domain}.conf`}`; }
   mapPath() { return `${this.config.nginxConfDir}/${MAP_FILE}`; }
   certDir(site) { return site.tls ? `${this.config.letsencryptDir}/live/${site.tls.certName}` : null; }
 
@@ -147,7 +173,8 @@ class DomainManager {
   }
   upstreamLabel(site, app) {
     const u = site.upstream;
-    return u.type === 'app' ? `app: ${app ? app.name : '(deleted)'}` : u.type === 'url' ? u.url : `static: ${u.root}`;
+    if (u.type === 'external') return `existing config (${u.kind}${u.root ? `: ${u.root}` : u.target ? `: ${u.target}` : ''})`;
+    return u.type === 'app' ? `app: ${app ? app.name : '(deleted)'}${app ? ` (${P.BY_ID[app.framework || 'node'].label.split(' (')[0]})` : ''}` : u.type === 'url' ? u.url : `static: ${u.root}`;
   }
   list(serverId, admin = true) { return this.sites.filter((s) => s.serverId === serverId).map((s) => this.publicSite(s, admin)); }
 
@@ -157,9 +184,18 @@ class DomainManager {
     if (u.type === 'app') {
       const app = this.deploy.apps.find((a) => a.id === u.appId);
       if (!app) throw httpError(400, 'The app this domain points to no longer exists');
-      return `http://127.0.0.1:${app.port}`;
+      return P.resolve(app).mode === 'service' ? `http://127.0.0.1:${app.port}` : null;
     }
     return null;
+  }
+
+  /** For apps that nginx serves directly (static builds, PHP): where the files are and how to serve them. */
+  appCtx(site) {
+    if (!site.upstream || site.upstream.type !== 'app') return null;
+    const app = this.deploy.apps.find((a) => a.id === site.upstream.appId);
+    if (!app) return null;
+    const cfg = P.resolve(app);
+    return cfg.mode === 'service' ? null : { mode: cfg.mode, root: `${this.deploy.appDir(app)}/live`, spa: cfg.spa, fastcgi: this.config.phpSocket };
   }
 
   validateOwnership(serverId, v, selfId) {
@@ -221,7 +257,7 @@ class DomainManager {
     if (!version) throw httpError(400, 'nginx is not installed on this server (Deploy → Prepare server)');
     const http2 = version[0] > 1 || (version[0] === 1 && (version[1] > 25 || (version[1] === 25 && version[2] >= 1))) ? 'directive' : 'listen';
     const conf = site.rawConfig ? site.rawConfig : renderNginx(site, {
-      ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir,
+      ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir,
       acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2,
     });
     const p = this.confPath(site);
@@ -250,7 +286,7 @@ class DomainManager {
     const host = this.servers.entry(site.serverId).host;
     const version = (await this.nginxVersion(host).catch(() => null)) || [1, 28, 0];
     const http2 = version[0] > 1 || version[1] > 25 || (version[1] === 25 && version[2] >= 1) ? 'directive' : 'listen';
-    return renderNginx(site, { ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir, acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2 });
+    return renderNginx(site, { ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir, acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2 });
   }
 
   // ------------------------------------------------------------------ editing nginx files directly
@@ -301,6 +337,8 @@ class DomainManager {
       throw httpError(400, `nginx rejected the configuration, so nothing was changed:\n${t.output}`);
     }
     await this.reload(host);
+    const owner = this.sites.find((x) => x.serverId === serverId && x.confFile === name);
+    if (owner) { owner.rawConfig = body; this.store.save(); }
     return { ok: true, created: prev === null, test: t.output };
   }
 
@@ -316,6 +354,59 @@ class DomainManager {
     if (!t.ok) { await this.writeFile(host, p, prev); throw httpError(400, `Deleting this file breaks the nginx configuration, so it was restored:\n${t.output}`); }
     await this.reload(host);
     return { ok: true };
+  }
+
+  // ------------------------------------------------------------------ adopting hand-written sites
+
+  /** Unmanaged files in conf.d that define real sites, with what we could read from them. */
+  async discover(serverId) {
+    const host = this.servers.entry(serverId).host;
+    const files = (await this.listFiles(serverId)).filter((f) => !f.main && !f.managed);
+    const out = [];
+    for (const f of files) {
+      const text = await this.readFile(host, f.path);
+      if (text === null) continue;
+      const sum = summarizeFile(text);
+      if (!sum.servers || sum.onlyDefault || !sum.names.length) continue;
+      const adopted = this.sites.find((x) => x.serverId === serverId && x.confFile === f.name);
+      out.push({
+        file: f.name, size: f.size, names: sum.names, kind: sum.kind, root: sum.root, target: sum.proxy || sum.fastcgi,
+        https: !!sum.sslCert, redirectsToHttps: sum.redirectsToHttps, cert: sum.sslCert,
+        laravelPath: sum.kind === 'php' && sum.root && /\/public\/?$/.test(sum.root) ? sum.root.replace(/\/public\/?$/, '') : null,
+        adopted: adopted ? adopted.id : null,
+      });
+    }
+    return out;
+  }
+
+  /** Take over an existing nginx file in place: nothing is rewritten, the panel just starts managing it. */
+  async adopt(serverId, file, user) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\.conf$/.test(String(file || '')) || this.isManaged(file)) throw httpError(400, 'Choose one of the existing nginx files');
+    if (this.sites.some((x) => x.serverId === serverId && x.confFile === file)) throw httpError(409, 'That file is already managed by the panel');
+    const host = this.servers.entry(serverId).host;
+    const text = await this.readFile(host, `${this.config.nginxConfDir}/${file}`);
+    if (text === null) throw httpError(404, 'File not found');
+    const sum = summarizeFile(text);
+    const valid = sum.names.filter((n) => HOST_RE.test(n));
+    if (!valid.length) throw httpError(400, 'No domain names (server_name) found in that file');
+    const [domain, ...aliases] = valid;
+    this.validateOwnership(serverId, { domain, aliases });
+    let tls = null;
+    if (sum.sslCert) {
+      const m = sum.sslCert.match(new RegExp(`^${this.config.letsencryptDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/live/([^/]+)/fullchain\\.pem$`));
+      tls = m ? { certName: m[1], email: null, staging: false, adopted: true, issuedAt: null } : { external: true, certFile: sum.sslCert, adopted: true };
+    }
+    const site = {
+      id: crypto.randomUUID(), serverId, domain, aliases, adopted: true, confFile: file,
+      upstream: { type: 'external', kind: sum.kind, root: sum.root, target: sum.proxy || sum.fastcgi },
+      forceHttps: sum.redirectsToHttps, hsts: false, maxBodyMb: 10, customConfig: '', rawConfig: text.replace(/\n*$/, '\n'),
+      tls, created: new Date().toISOString(), createdBy: user,
+    };
+    // the stored copy must equal the file byte for byte, otherwise "in sync" would lie
+    site.rawConfig = text;
+    this.sites.push(site);
+    this.store.save();
+    return site;
   }
 
   // ------------------------------------------------------------------ CRUD
@@ -345,9 +436,10 @@ class DomainManager {
     return site;
   }
 
-  async remove(id, { removeCert = false } = {}) {
+  async remove(id, { removeCert = false, keepFile } = {}) {
     const site = this.find(id);
-    await this.removeConfig(site);
+    // an adopted (hand-written) site is only forgotten by default: its nginx file is left exactly as it was
+    if (!(site.adopted && keepFile !== false)) await this.removeConfig(site);
     if (removeCert && site.tls) await this.certDelete(site).catch(() => {});
     this.store.data.sites = this.sites.filter((s) => s.id !== id);
     this.store.save();
@@ -358,7 +450,7 @@ class DomainManager {
   async certInfo(site) {
     if (!site.tls) return null;
     const host = this.servers.entry(site.serverId).host;
-    const r = await host.runPriv('openssl', ['x509', '-in', `${this.certDir(site)}/fullchain.pem`, '-noout', '-enddate', '-issuer', '-subject', '-ext', 'subjectAltName']);
+    const r = await host.runPriv('openssl', ['x509', '-in', site.tls.certFile || `${this.certDir(site)}/fullchain.pem`, '-noout', '-enddate', '-issuer', '-subject', '-ext', 'subjectAltName']);
     if (!r.ok) return { present: false, error: (r.stderr || 'certificate file not readable').trim() };
     const end = (r.stdout.match(/notAfter=(.+)/) || [])[1];
     const issuer = (r.stdout.match(/issuer=(.+)/) || [])[1] || '';
@@ -372,6 +464,7 @@ class DomainManager {
 
   async issue(id, { email, staging = false }) {
     const site = this.find(id);
+    if (site.tls && site.tls.external) throw httpError(400, 'This domain uses a certificate the panel did not issue; manage it where you created it.');
     if (!/^[^\s@'"\\]+@[^\s@'"\\]+\.[A-Za-z]{2,}$/.test(String(email || ''))) throw httpError(400, 'A valid email address is required (Let\'s Encrypt sends expiry warnings there)');
     if (site.rawConfig && !site.rawConfig.includes('.well-known/acme-challenge')) {
       throw httpError(400, `This domain uses a manual nginx configuration without a /.well-known/acme-challenge/ location, so Let's Encrypt cannot validate it. Add:\n\nlocation ^~ /.well-known/acme-challenge/ { root ${this.config.acmeRoot}; }\n\n(or switch back to the generated configuration).`);
@@ -396,6 +489,7 @@ class DomainManager {
   async renew(id) {
     const site = this.find(id);
     if (!site.tls) throw httpError(400, 'No certificate to renew');
+    if (site.tls.external) throw httpError(400, 'This certificate is not managed by certbot, so the panel cannot renew it.');
     const host = this.servers.entry(site.serverId).host;
     const args = ['renew', '--cert-name', site.tls.certName, '--force-renewal', '--non-interactive'];
     if (this.config.letsencryptDir !== '/etc/letsencrypt') args.push('--config-dir', this.config.letsencryptDir);

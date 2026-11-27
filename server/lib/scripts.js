@@ -3,8 +3,12 @@
  * Bash scripts executed on managed servers (via `bash -s`, script on stdin).
  * Every interpolated value goes through shq(); secrets (git tokens/keys, env vars) live only inside the
  * script text that travels over the SSH channel's stdin, so they never show up in `ps` on the target.
+ *
+ * Three run modes (see presets.js): service (systemd + port), static (nginx serves a build folder), php (PHP-FPM).
+ * Layout: $APP_DIR/{releases/<id>, shared/, current -> release, live -> release/<output folder> (static/php only)}
  */
 const { shq } = require('./host');
+const { detectScript } = require('./presets');
 
 const PRIV = `priv() { if [ "\${USE_SUDO:-0}" = 1 ] && [ "$(id -u)" != 0 ]; then sudo -n "$@"; else "$@"; fi; }
 step() { echo; echo "==> $*"; }`;
@@ -18,12 +22,9 @@ function envShellText(vars) {
   return Object.entries(vars).map(([k, v]) => `export ${k}=${shq(v)}`).join('\n') + '\n';
 }
 
-const DEFAULT_INSTALL = 'if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi';
-const DEFAULT_BUILD = `if node -e "const s=require('./package.json').scripts;process.exit(s&&s.build?0:1)"; then npm run build; else echo "(no build script - skipping)"; fi`;
-
-function startScript(app, appDir) {
+function startScript(app, cfg, appDir) {
   const path = app.extraPath ? `export PATH=${shq(app.extraPath)}:"$PATH"\n` : '';
-  return `#!/bin/bash\n# Managed by Server Panel\n${path}cd ${shq(appDir + '/current')} || exit 1\nexec bash -c ${shq(app.startCmd || 'npm start')}\n`;
+  return `#!/bin/bash\n# Managed by Server Panel\n${path}cd ${shq(appDir + '/current')} || exit 1\nexec bash -c ${shq(cfg.start || 'npm start')}\n`;
 }
 
 function unitText(app, appDir, user) {
@@ -49,36 +50,77 @@ WantedBy=multi-user.target
 `;
 }
 
-// default: any HTTP answer below 500 counts as "up" (an API root may legitimately 404); strict: 2xx/3xx only
+// Health: service = HTTP on the app's port; static = the build has an index file; php = HTTP through nginx when a
+// host name is known, otherwise "index.php exists". Default: any answer below 500 counts as up (an API root may 404).
 const healthFn = (app) => {
   const check = app.healthStrict ? '{ [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; }' : '[ "$code" -lt 500 ]';
-  return `wait_healthy() {
-  local i code
-  step "Health check http://127.0.0.1:$PORT$HEALTH (up to \${HEALTH_TIMEOUT}s)"
+  return `healthy_once() {
+  local code
+  case "$MODE" in
+    service)
+      code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$PORT$HEALTH" 2>/dev/null || true); code=\${code:-000}
+      [ "$code" != 000 ] && ${check} && priv systemctl is-active --quiet "$UNIT" ;;
+    static) [ -f "$APP_DIR/live/index.html" ] || [ -f "$APP_DIR/live/index.htm" ] ;;
+    php)
+      if [ -n "$HEALTH_HOST" ]; then
+        code=$(curl -s -o /dev/null -m 5 -H "Host: $HEALTH_HOST" -w '%{http_code}' "http://127.0.0.1$HEALTH" 2>/dev/null || true); code=\${code:-000}
+        [ "$code" != 000 ] && ${check}
+      else [ -f "$APP_DIR/live/index.php" ]; fi ;;
+  esac
+}
+wait_healthy() {
+  local i
+  case "$MODE" in service) step "Health check http://127.0.0.1:$PORT$HEALTH (up to \${HEALTH_TIMEOUT}s)";; php) step "Health check (up to \${HEALTH_TIMEOUT}s)";; *) step "Checking the build output";; esac
   for i in $(seq 1 "$HEALTH_TIMEOUT"); do
-    code=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$PORT$HEALTH" 2>/dev/null || true)
-    code=\${code:-000}
-    if [ "$code" != 000 ] && ${check} && priv systemctl is-active --quiet "$UNIT"; then echo "healthy (HTTP $code after \${i}s)"; return 0; fi
+    if healthy_once; then echo "healthy (after \${i}s)"; return 0; fi
     sleep 1
   done
   return 1
 }`;
 };
 
-function common(app, ctx) {
+function common(app, cfg, ctx) {
   return `set -euo pipefail
 export LC_ALL=C GIT_TERMINAL_PROMPT=0
 USE_SUDO=${ctx.useSudo ? 1 : 0}
 ${PRIV}
 APP_DIR=${shq(ctx.appDir)}
-UNIT=${shq(app.unit)}
+MODE=${shq(cfg.mode)}
+UNIT=${shq(app.unit || '')}
 UNIT_DIR=${shq(ctx.unitDir)}
-PORT=${Number(app.port)}
-HEALTH=${shq(app.healthPath || '/')}
-HEALTH_TIMEOUT=${Number(app.healthTimeout) || 30}
+PORT=${Number(app.port) || 0}
+HEALTH=${shq(cfg.healthPath || '/')}
+HEALTH_HOST=${shq(app.healthHost || '')}
+HEALTH_TIMEOUT=${Number(cfg.healthTimeout) || 30}
 KEEP=${Number(app.keepReleases) || 5}
+APP_USER=${shq(ctx.appUser || '')}
+FPM_UNIT=${shq(ctx.fpmUnit || 'php-fpm.service')}
 TMP=$(mktemp -d)
 STATE=""; ACTIVATED=0; REL=""
+# run a command string in the release folder with the app's environment, as the app user (own build files, own caches)
+as_app() {
+  local run=(bash -ec 'set -a; . "$1"; set +a; export HOME="$4"; cd "$2"; eval "$3"' _ "$APP_DIR/shared/.env.sh" "\${REL}" "$1" "$APP_DIR/shared/home")
+  if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then sudo -n -u "$APP_USER" "\${run[@]}"; else "\${run[@]}"; fi
+}
+# install a file with the app user as owner (when different from the SSH user)
+put() { if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv install -m "$3" -o "$APP_USER" "$1" "$2"; else install -m "$3" "$1" "$2"; fi; }
+# atomic switch: current -> release; live -> release/<output folder> for static and php apps
+activate() {
+  local r="$1" o
+  ln -sfn "$r" "$APP_DIR/current.new"; mv -Tf "$APP_DIR/current.new" "$APP_DIR/current"
+  if [ "$MODE" != service ]; then
+    o=$(cat "$r/.outdir" 2>/dev/null || echo .)
+    ln -sfn "$r/$o" "$APP_DIR/live.new"; mv -Tf "$APP_DIR/live.new" "$APP_DIR/live"
+  fi
+}
+# make the new code take effect
+apply_release() {
+  case "$MODE" in
+    service) priv systemctl restart "$UNIT" ;;
+    php) priv systemctl reload "$FPM_UNIT" 2>/dev/null || echo "(could not reload PHP-FPM; OPcache may serve old code for a moment)" ;;
+    *) true ;;
+  esac
+}
 ${healthFn(app)}
 on_exit() {
   rc=$?
@@ -89,32 +131,50 @@ trap on_exit EXIT
 `;
 }
 
-/** Full deploy: clone -> env -> install -> build -> service -> atomic switch -> health check (-> rollback). */
-function deployScript(app, ctx) {
-  const { appDir, relId, ref, secrets } = ctx;
-  const protocols = ctx.allowLocalRepos ? 'https:ssh:file' : 'https:ssh';
-  let gitAuth = '';
+const GIT_AUTH = (app, secrets) => {
   if (app.authType === 'token' && secrets.gitSecret) {
     const askpass = `#!/bin/sh\ncase "$1" in Username*) printf '%s\\n' ${shq(app.tokenUser || 'x-access-token')};; *) printf '%s\\n' ${shq(secrets.gitSecret)};; esac\n`;
-    gitAuth = `printf %s ${shq(askpass)} > "$TMP/askpass"; chmod 700 "$TMP/askpass"; export GIT_ASKPASS="$TMP/askpass"\n`;
-  } else if (app.authType === 'key' && secrets.gitSecret) {
+    return `printf %s ${shq(askpass)} > "$TMP/askpass"; chmod 700 "$TMP/askpass"; export GIT_ASKPASS="$TMP/askpass"\n`;
+  }
+  if (app.authType === 'key' && secrets.gitSecret) {
     const key = secrets.gitSecret.endsWith('\n') ? secrets.gitSecret : secrets.gitSecret + '\n';
-    gitAuth = `umask 077; printf %s ${shq(key)} > "$TMP/key"; umask 022
+    return `umask 077; printf %s ${shq(key)} > "$TMP/key"; umask 022
 export GIT_SSH_COMMAND="ssh -i $TMP/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$APP_DIR/shared/known_hosts -o BatchMode=yes"\n`;
   }
-  return `${common(app, ctx)}export GIT_ALLOW_PROTOCOL=${protocols}
+  return '';
+};
+
+const TOOL_COMMAND = { node: 'node', java: 'java', php: 'php', composer: 'composer', dotnet: 'dotnet', go: 'go', python: 'python3', git: 'git' };
+
+/** Full deploy: clone -> env -> shared dirs -> install -> build -> (release cmd) -> activate -> health check (-> rollback). */
+function deployScript(app, cfg, ctx) {
+  const { appDir, relId, ref, secrets } = ctx;
+  const protocols = ctx.allowLocalRepos ? 'https:ssh:file' : 'https:ssh';
+  const shared = (cfg.sharedPaths || []).map((p) => `
+SP="$APP_DIR/shared/"${shq(p)}
+if [ ! -e "$SP" ]; then
+  mkdir -p "$(dirname "$SP")"
+  if [ -e "$REL/"${shq(p)} ]; then cp -a "$REL/"${shq(p)} "$SP"; else mkdir -p "$SP"; fi
+  if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv chown -R "$APP_USER": "$SP"; fi
+  echo "created shared ${p}"
+fi
+rm -rf "$REL/"${shq(p)}; mkdir -p "$(dirname "$REL/"${shq(p)})"; ln -s "$SP" "$REL/"${shq(p)}`).join('');
+  const tools = ['git', ...(cfg.tools || [])].map((t) => `command -v ${TOOL_COMMAND[t] || t} >/dev/null 2>&1 || { echo "!! ${t} is not installed on this server. Open Deploy, then Server readiness, and click Install."; exit 1; }`).join('\n');
+  const run = (label, cmd) => (cmd ? `step ${shq(label)}\nas_app ${shq(cmd)}\n` : '');
+  return `${common(app, cfg, ctx)}export GIT_ALLOW_PROTOCOL=${protocols}
 REL="$APP_DIR/releases/${relId}"
 
 step "Preparing $APP_DIR"
 if ! mkdir -p "$APP_DIR/releases" "$APP_DIR/shared" 2>/dev/null; then
   priv mkdir -p "$APP_DIR"; priv chown "$(id -un):$(id -gn)" "$APP_DIR"; mkdir -p "$APP_DIR/releases" "$APP_DIR/shared"
 fi
+mkdir -p "$APP_DIR/shared/home"
+if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv chown "$APP_USER": "$APP_DIR/shared/home"; fi
 PREV=$(readlink "$APP_DIR/current" 2>/dev/null || true)
-command -v git >/dev/null || { echo "git is not installed on this server (use Deploy -> Prepare server)"; exit 1; }
-command -v node >/dev/null || { echo "node is not installed on this server (use Deploy -> Prepare server)"; exit 1; }
+${tools}
 
 step "Cloning ${ctx.repoLabel} (${ref})"
-${gitAuth}git clone --depth 1 --branch ${shq(ref)} -- ${shq(app.repoUrl)} "$REL"
+${GIT_AUTH(app, secrets)}git clone --depth 1 --branch ${shq(ref)} -- ${shq(app.repoUrl)} "$REL"
 SHA=$(git -C "$REL" rev-parse HEAD)
 echo "@@COMMIT $SHA"
 echo "@@MSG $(git -C "$REL" log -1 --pretty=%s | head -c 200)"
@@ -122,18 +182,24 @@ printf '%s\\n' "$SHA" > "$REL/.release-commit"
 rm -rf "$REL/.git"
 
 step "Writing environment"
-umask 077
-printf %s ${shq(ctx.envFile)} > "$APP_DIR/shared/.env"
-printf %s ${shq(ctx.envShell)} > "$APP_DIR/shared/.env.sh"
-umask 022
+printf %s ${shq(ctx.envFile)} > "$TMP/env"; printf %s ${shq(ctx.envShell)} > "$TMP/envsh"
+put "$TMP/env" "$APP_DIR/shared/.env" 600
+put "$TMP/envsh" "$APP_DIR/shared/.env.sh" 600
 ln -sfn "$APP_DIR/shared/.env" "$REL/.env"
-
-step "Installing dependencies"
-( set -a; . "$APP_DIR/shared/.env.sh"; set +a; cd "$REL"; bash -ec ${shq(app.installCmd || DEFAULT_INSTALL)} )
-
-step "Building"
-( set -a; . "$APP_DIR/shared/.env.sh"; set +a; cd "$REL"; bash -ec ${shq(app.buildCmd || DEFAULT_BUILD)} )
-
+if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv chown -R "$APP_USER": "$REL"; fi
+${shared ? `\nstep "Linking shared folders"${shared}\n` : ''}
+${run('Installing dependencies', cfg.install)}${run('Building', cfg.build)}${cfg.mode === 'service' ? '' : `
+OUTDIR=${shq(cfg.outputDir || 'auto')}
+if [ "$OUTDIR" = auto ]; then
+  OUTDIR=$(cd "$REL" && find dist build out .output/public public -maxdepth 4 -name index.html -not -path '*/node_modules/*' 2>/dev/null | awk '{print length($0), $0}' | sort -n | head -1 | cut -d' ' -f2- | xargs -r dirname) || true
+  if [ -z "$OUTDIR" ] && [ -f "$REL/index.html" ]; then OUTDIR=.; fi
+  if [ -z "$OUTDIR" ]; then echo "!! Could not find the build output (no index.html in dist/, build/, out/ or public/). Set the output folder in the app's advanced settings."; exit 1; fi
+  OUTDIR=\${OUTDIR#./}
+fi
+[ -d "$REL/$OUTDIR" ] || { echo "!! The output folder '$OUTDIR' does not exist after the build."; exit 1; }
+echo "$OUTDIR" > "$REL/.outdir"
+echo "Serving the folder: $OUTDIR"
+`}${run('Running the release command (before going live)', cfg.releaseCmd)}${cfg.mode === 'service' ? `
 step "Configuring service $UNIT"
 printf %s ${shq(ctx.startSh)} > "$APP_DIR/shared/start.sh"; chmod 755 "$APP_DIR/shared/start.sh"
 printf %s ${shq(ctx.unit)} > "$TMP/unit"
@@ -141,26 +207,24 @@ if ! priv cmp -s "$TMP/unit" "$UNIT_DIR/$UNIT" 2>/dev/null; then
   priv install -m 644 "$TMP/unit" "$UNIT_DIR/$UNIT"; priv systemctl daemon-reload
   echo "service file updated"
 else echo "service file unchanged"; fi
-
-step "Activating release"
-ln -sfn "$REL" "$APP_DIR/current.new"; mv -Tf "$APP_DIR/current.new" "$APP_DIR/current"; ACTIVATED=1
-priv systemctl enable "$UNIT" >/dev/null 2>&1 || true
-priv systemctl restart "$UNIT"
+` : ''}
+step "Going live"
+activate "$REL"; ACTIVATED=1
+${cfg.mode === 'service' ? 'priv systemctl enable "$UNIT" >/dev/null 2>&1 || true\n' : ''}apply_release
 if ! wait_healthy; then
   echo "!! Health check failed"
-  priv journalctl -u "$UNIT" -n 40 --no-pager 2>&1 || true
+  ${cfg.mode === 'service' ? 'priv journalctl -u "$UNIT" -n 40 --no-pager 2>&1 || true' : 'true'}
   if [ -n "$PREV" ] && [ -d "$PREV" ]; then
     step "Rolling back to $(basename "$PREV")"
-    ln -sfn "$PREV" "$APP_DIR/current.new"; mv -Tf "$APP_DIR/current.new" "$APP_DIR/current"
-    priv systemctl restart "$UNIT" || true
+    activate "$PREV"; apply_release || true
     if wait_healthy; then STATE=rolled_back; echo "@@STATE rolled_back"
-    else echo "!! The previous release is not healthy either - the app is DOWN. Check the service logs."; STATE=failed; echo "@@STATE failed"; fi
+    else echo "!! The previous release is not healthy either - the app is DOWN. Check the logs."; STATE=failed; echo "@@STATE failed"; fi
   else
     STATE=failed; echo "@@STATE failed"
   fi
   exit 1
 fi
-
+${cfg.afterCmd ? `\nstep ${shq('Running the after-deploy command')}\nREL="$APP_DIR/current"\nas_app ${shq(cfg.afterCmd)} || echo "(the after-deploy command failed; the release is live anyway)"\n` : ''}
 step "Cleaning old releases (keeping $KEEP)"
 cur=$(readlink "$APP_DIR/current")
 ls -1dt "$APP_DIR"/releases/*/ 2>/dev/null | sed 's#/$##' | tail -n +$((KEEP + 1)) | while read -r d; do
@@ -171,22 +235,22 @@ echo; echo "Deployed $SHA"
 `;
 }
 
-/** Point `current` at an existing release, restart, health-check. */
-function rollbackScript(app, ctx) {
-  return `${common(app, ctx)}REL=${shq(ctx.appDir + '/releases/' + ctx.release)}
+/** Point `current` (and `live`) at an existing release, apply, health-check. */
+function rollbackScript(app, cfg, ctx) {
+  return `${common(app, cfg, ctx)}REL=${shq(ctx.appDir + '/releases/' + ctx.release)}
 [ -d "$REL" ] || { echo "release not found: $REL"; exit 1; }
 PREV=$(readlink "$APP_DIR/current" 2>/dev/null || true)
 step "Switching to ${ctx.release}"
-ln -sfn "$REL" "$APP_DIR/current.new"; mv -Tf "$APP_DIR/current.new" "$APP_DIR/current"; ACTIVATED=1
+activate "$REL"; ACTIVATED=1
 echo "@@COMMIT $(cat "$REL/.release-commit" 2>/dev/null || echo unknown)"
-priv systemctl restart "$UNIT"
+${cfg.releaseCmd ? 'echo "Note: database changes made by earlier release commands (such as migrations) are NOT reverted by a rollback."\n' : ''}apply_release
 if ! wait_healthy; then
   echo "!! Health check failed"
   if [ -n "$PREV" ] && [ -d "$PREV" ]; then
     step "Restoring $(basename "$PREV")"
-    ln -sfn "$PREV" "$APP_DIR/current.new"; mv -Tf "$APP_DIR/current.new" "$APP_DIR/current"; priv systemctl restart "$UNIT" || true
+    activate "$PREV"; apply_release || true
     if wait_healthy; then STATE=rolled_back; echo "@@STATE rolled_back"
-    else echo "!! The previous release is not healthy either - the app is DOWN. Check the service logs."; STATE=failed; echo "@@STATE failed"; fi
+    else echo "!! The previous release is not healthy either - the app is DOWN. Check the logs."; STATE=failed; echo "@@STATE failed"; fi
   else STATE=failed; echo "@@STATE failed"; fi
   exit 1
 fi
@@ -194,16 +258,17 @@ STATE=ok; echo "@@STATE ok"
 `;
 }
 
-/** Write the app's env files and restart the service (no rebuild); report whether it came back healthy. */
-function envApplyScript(app, ctx) {
-  return `${common(app, ctx)}[ -d "$APP_DIR/current" ] || { echo "This app has not been deployed yet: deploy it first."; exit 1; }
+/** Write the app's env files and make them take effect (restart / reload + the preset's reload command). */
+function envApplyScript(app, cfg, ctx) {
+  if (cfg.mode === 'static') return 'echo "Static sites read their settings at build time: deploy again to apply environment changes."; echo "@@STATE failed"; exit 1\n';
+  return `${common(app, cfg, ctx)}[ -d "$APP_DIR/current" ] || { echo "This app has not been deployed yet: deploy it first."; exit 1; }
+REL=$(readlink -f "$APP_DIR/current")
 step "Writing environment"
-umask 077
-printf %s ${shq(ctx.envFile)} > "$APP_DIR/shared/.env"
-printf %s ${shq(ctx.envShell)} > "$APP_DIR/shared/.env.sh"
-umask 022
-step "Restarting $UNIT"
-priv systemctl restart "$UNIT"
+printf %s ${shq(ctx.envFile)} > "$TMP/env"; printf %s ${shq(ctx.envShell)} > "$TMP/envsh"
+put "$TMP/env" "$APP_DIR/shared/.env" 600
+put "$TMP/envsh" "$APP_DIR/shared/.env.sh" 600
+${cfg.reloadCmd ? `step ${shq('Refreshing the application')}\nas_app ${shq(cfg.reloadCmd)} || echo "(refresh command failed)"\n` : ''}step "Applying"
+apply_release
 if wait_healthy; then STATE=ok; echo "@@STATE ok"; else echo "!! The app did not become healthy with this environment. Fix the values and apply again."; STATE=failed; echo "@@STATE failed"; exit 1; fi
 `;
 }
@@ -213,31 +278,50 @@ function removeAppScript(app, ctx) {
   return `set -uo pipefail
 USE_SUDO=${ctx.useSudo ? 1 : 0}
 ${PRIV}
-UNIT=${shq(app.unit)}
+${app.unit ? `UNIT=${shq(app.unit)}
 priv systemctl stop "$UNIT" 2>/dev/null; priv systemctl disable "$UNIT" 2>/dev/null
-priv rm -f ${shq(ctx.unitDir + '/' + app.unit)}; priv systemctl daemon-reload
+priv rm -f ${shq(ctx.unitDir + '/' + app.unit)}; priv systemctl daemon-reload` : 'true'}
 ${ctx.deleteFiles ? `rm -rf -- ${shq(ctx.appDir)} 2>/dev/null || priv rm -rf -- ${shq(ctx.appDir)}` : 'true'}
 echo done
 `;
 }
 
+/** Shallow-clone a repository into a temp folder and report which framework preset matches. */
+function detectRepoScript(app, ctx) {
+  return `set -euo pipefail
+export LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=${ctx.allowLocalRepos ? 'https:ssh:file' : 'https:ssh'}
+TMP=$(mktemp -d); trap 'rm -rf -- "$TMP"' EXIT
+APP_DIR="$TMP"
+command -v git >/dev/null || { echo "@@ERROR git is not installed on this server"; exit 0; }
+${GIT_AUTH(app, ctx.secrets || {})}git clone --depth 1 --branch ${shq(ctx.ref)} -- ${shq(app.repoUrl)} "$TMP/src" >"$TMP/clone.log" 2>&1 || { echo "@@ERROR $(tail -3 "$TMP/clone.log" | tr '\\n' ' ' | head -c 300)"; exit 0; }
+cd "$TMP/src"
+echo "@@PRESET $(
+${detectScript()}
+)"
+`;
+}
+
 const TOOLS_CHECK = `
-for t in git node npm nginx certbot curl openssl python3; do
-  p=$(command -v $t 2>/dev/null) || { echo "$t=missing"; continue; }
-  case $t in
-    git) v=$($t --version 2>&1 | head -1 | awk '{print $3}');;
-    node) v=$($t --version 2>&1 | head -1);;
-    npm) v=$($t --version 2>&1 | head -1);;
-    nginx) v=$($t -v 2>&1 | head -1 | sed 's#.*/##' | awk '{print $1}');;
-    certbot) v=$($t --version 2>&1 | head -1 | awk '{print $2}');;
-    curl) v=$($t --version 2>&1 | head -1 | awk '{print $2}');;
-    openssl) v=$($t version 2>&1 | head -1 | awk '{print $2}');;
-    python3) v=$($t --version 2>&1 | head -1 | awk '{print $2}');;
-  esac
-  echo "$t=$v"
-done
+ver() { "$@" 2>&1 | head -1; }
+chk() { p=$(command -v "$1" 2>/dev/null) || { echo "$1=missing"; return; }; echo "$1=$2"; }
+chk git "$(git --version 2>&1 | awk '{print $3}')"
+chk node "$(node --version 2>&1 | head -1)"
+chk npm "$(npm --version 2>&1 | head -1)"
+chk nginx "$(nginx -v 2>&1 | head -1 | sed 's#.*/##' | awk '{print $1}')"
+chk certbot "$(certbot --version 2>&1 | head -1 | awk '{print $2}')"
+chk curl "$(curl --version 2>&1 | head -1 | awk '{print $2}')"
+chk openssl "$(openssl version 2>&1 | head -1 | awk '{print $2}')"
+chk java "$(java -version 2>&1 | head -1 | sed 's/.*"\\(.*\\)".*/\\1/')"
+chk dotnet "$(dotnet --version 2>&1 | head -1)"
+chk php "$(php -r 'echo PHP_VERSION;' 2>/dev/null)"
+chk composer "$(composer --version 2>/dev/null | head -1 | awk '{print $3}')"
+chk go "$(go version 2>&1 | awk '{print $3}')"
+chk python3 "$(python3 --version 2>&1 | awk '{print $2}')"
+chk mvn "$(mvn -v 2>&1 | head -1 | awk '{print $3}')"
 echo "nginx_active=$(systemctl is-active nginx 2>/dev/null || echo inactive)"
 echo "certbot_timer=$(systemctl is-active certbot-renew.timer 2>/dev/null || echo inactive)"
+echo "fpm_unit=$(systemctl list-unit-files --type=service --no-legend --plain 2>/dev/null | awk '{print $1}' | grep -E '^php.*fpm' | head -1)"
+echo "fpm_user=$(ps -eo user:32,comm 2>/dev/null | awk '$2 ~ /php-fpm/ && $1 != "root" {print $1}' | sort -u | head -1)"
 echo "user=$(id -un)"
 echo "sudo=$(if [ "$(id -u)" = 0 ]; then echo root; elif sudo -n true 2>/dev/null; then echo yes; else echo no; fi)"
 `;
@@ -261,21 +345,48 @@ Persistent=true
 WantedBy=timers.target
 `;
 
-/** Install prerequisites with dnf (Amazon Linux 2023). tools: subset of git,node,nginx,certbot */
+const COMPOSER_INSTALL = `step "Installing Composer (signature verified)"
+EXPECTED=$(curl -fsSL https://composer.github.io/installer.sig)
+curl -fsSL https://getcomposer.org/installer -o "$TMPC/installer.php"
+ACTUAL=$(php -r "echo hash_file('sha384', '$TMPC/installer.php');")
+[ "$EXPECTED" = "$ACTUAL" ] || { echo "Composer installer signature mismatch - aborting"; exit 1; }
+priv php "$TMPC/installer.php" --quiet --install-dir=/usr/local/bin --filename=composer
+priv ln -sf /usr/local/bin/composer /usr/bin/composer`;
+
+/** Install prerequisites with dnf (Amazon Linux 2023). */
 function installScript(tools, ctx) {
   const parts = [`set -euo pipefail
 USE_SUDO=${ctx.useSudo ? 1 : 0}
 ${PRIV}
+TMPC=$(mktemp -d); trap 'rm -rf "$TMPC"' EXIT
 command -v dnf >/dev/null || { echo "dnf not found - this installer targets Amazon Linux 2023"; exit 1; }`];
-  if (tools.includes('git')) parts.push('step "Installing git"; priv dnf -y install git');
-  if (tools.includes('node')) parts.push('step "Installing Node.js"; priv dnf -y install nodejs22 nodejs22-npm || priv dnf -y install nodejs20 nodejs20-npm');
-  if (tools.includes('nginx')) {
+  const want = (t) => tools.includes(t);
+  if (want('git')) parts.push('step "Installing git"; priv dnf -y install git');
+  if (want('node')) parts.push('step "Installing Node.js"; priv dnf -y install nodejs22 nodejs22-npm || priv dnf -y install nodejs20 nodejs20-npm');
+  if (want('java')) parts.push('step "Installing Java (Amazon Corretto 21)"; priv dnf -y install java-21-amazon-corretto-devel');
+  if (want('maven')) parts.push('step "Installing Maven"; priv dnf -y install maven-amazon-corretto21 || priv dnf -y install maven');
+  if (want('dotnet')) parts.push('step "Installing .NET SDK 8"; priv dnf -y install dotnet-sdk-8.0');
+  if (want('go')) parts.push('step "Installing Go"; priv dnf -y install golang');
+  if (want('python')) parts.push('step "Installing Python"; priv dnf -y install python3 python3-pip');
+  if (want('php')) {
+    parts.push(`step "Installing PHP 8.3 + PHP-FPM"
+priv dnf -y install php8.3 php8.3-fpm php8.3-cli php8.3-common php8.3-mbstring php8.3-xml php8.3-mysqlnd php8.3-pdo php8.3-gd php8.3-intl php8.3-bcmath php8.3-opcache php8.3-process unzip
+# nginx must be able to use the PHP-FPM socket
+if [ -f /etc/php-fpm.d/www.conf ]; then
+  priv sed -i -E 's/^;?(user|group|listen\\.owner|listen\\.group) = .*/\\1 = nginx/' /etc/php-fpm.d/www.conf
+  priv sed -i -E 's#^;?listen\\.mode = .*#listen.mode = 0660#' /etc/php-fpm.d/www.conf
+fi
+priv systemctl enable --now php-fpm
+echo "PHP-FPM runs as the nginx user and listens on /run/php-fpm/www.sock"`);
+  }
+  if (want('composer')) parts.push(`command -v php >/dev/null || { echo "Install PHP first"; exit 1; }\n${COMPOSER_INSTALL}`);
+  if (want('nginx')) {
     parts.push(`step "Installing nginx"; priv dnf -y install nginx
 priv mkdir -p ${shq(ctx.acmeRoot)}
 priv systemctl enable --now nginx
 echo "nginx enabled and started. Remember to allow inbound ports 80 and 443 in the security group."`);
   }
-  if (tools.includes('certbot')) {
+  if (want('certbot')) {
     parts.push(`step "Installing certbot (Python venv, as recommended for Amazon Linux 2023)"
 priv dnf -y install python3 python3-pip augeas-libs
 priv python3 -m venv /opt/certbot
@@ -297,5 +408,5 @@ echo "automatic renewal timer enabled"`);
 
 module.exports = {
   envFileText, envShellText, startScript, unitText, deployScript, rollbackScript, envApplyScript, removeAppScript,
-  installScript, TOOLS_CHECK, DEFAULT_INSTALL, DEFAULT_BUILD,
+  detectRepoScript, installScript, TOOLS_CHECK,
 };

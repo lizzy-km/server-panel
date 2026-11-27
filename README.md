@@ -4,13 +4,13 @@ A self-hosted control panel that manages **Amazon Linux 2023** (EC2) servers **o
 the SSH key (`.pem` or PuTTY `.ppk`); it connects and gives you monitoring, services, updates, Docker, files, logs, cron
 and a terminal for that machine. Add as many servers as you like and switch between them.
 
-Node ≥ 20, vanilla-JS frontend, no build step. The one runtime dependency (`ssh2` and its 4 small pure-JavaScript dependencies, 2 MB) is **vendored in `node_modules/`**, so there is nothing to install: clone and run.
+**Design rule: everything is a button.** You should never have to type a command to run your servers. Commands exist only under “Advanced” overrides for unusual apps. Node ≥ 20, vanilla-JS frontend, no build step. The one runtime dependency (`ssh2` and its 4 small pure-JavaScript dependencies, 2 MB) is **vendored in `node_modules/`**, so there is nothing to install: clone and run.
 
 | Area | What you get (per server) |
 |---|---|
 | **Dashboard** | Live CPU (total + per-core), memory/swap, network throughput, disks, system info, EC2 instance details (IMDSv2), threshold alerts |
 | **Processes** | Sortable/filterable list; send SIGTERM/SIGKILL (admin) |
-| **Deploy** | Node.js apps from Git: clone → install → build → zero-downtime switch → health check → **automatic rollback**; live deploy log, history, one-click rollback to any kept release, `.env` editor, webhook auto-deploy, service controls and logs |
+| **Deploy** | Any framework from Git (React, Vue, Angular, Next.js, Nest, Express, Spring Boot, .NET, Laravel/PHP, Go, Python, plain HTML…): pick it from a list (or let the panel detect it), then clone → build → zero-downtime switch → health check → **automatic rollback**; live deploy log, history, one-click rollback, `.env` editor, webhook auto-deploy, one-click install of the runtimes it needs |
 | **Domains** | nginx virtual hosts for apps / URLs / static sites, **Let's Encrypt** certificates with auto-renewal, DNS checks (3 resolvers, A/AAAA/CNAME/NS/MX/TXT/CAA), HTTP/HTTPS checks including *direct-to-server* before DNS cut-over, **editable nginx config** (per domain and `nginx.conf` / `conf.d`) |
 | **Services** | systemd units: state, enable/disable, start/stop/restart, `systemctl status` |
 | **Updates** | `dnf` updates with security advisories (ALAS), reboot-required notice; update one package / security-only / all |
@@ -25,14 +25,16 @@ Node ≥ 20, vanilla-JS frontend, no build step. The one runtime dependency (`ss
 
 ## Quick start
 
+**Windows / macOS:** double-click **`Start Server Panel.bat`** (macOS/Linux: `start-panel.sh`). It starts the panel, opens your browser and fills in the one-time setup token for you. You only need [Node.js 20+](https://nodejs.org) installed.
+
 ```bash
-node server/index.js          # prints a one-time setup token — no `npm install` needed
+node server/launch.js         # same thing from a terminal; `node server/index.js` prints the setup token instead
 ```
 
 Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
 
 ```bash
-npm test    # 94 tests: unit tests + end-to-end SSH/SFTP/deploy/nginx tests against a real sshd (skipped if sshd isn't installed)
+npm test    # 127 tests: unit tests + end-to-end SSH/SFTP/deploy/nginx/PHP/Go/Java tests against a real sshd (skipped if sshd isn't installed)
 ```
 
 ## Adding a server
@@ -64,33 +66,37 @@ connections are instant. The Argon2 code is verified against the RFC 9106 test v
 (monitoring, process list, service list, files you own). Optional: `cronie` (Cron page), Docker, `dnf-utils` (reboot notice).
 Servers reachable only through SSM Session Manager (no SSH port at all) are **not** supported.
 
-## Deploying apps
+## Deploying apps (any framework)
 
-**Deploy → Prepare server** installs git, Node.js, nginx and certbot with `dnf` (one click, with a live log). Then **New app**:
-repository URL (HTTPS or SSH; public, access token, or deploy key), branch/tag, port, optional install/build/start commands (defaults: `npm ci`,
-`npm run build` if present, `npm start`), environment variables, health-check path.
+**New app → paste the Git repository → Detect framework** (or pick one from the list). The panel fills in the build, start, serving and health settings.
+If the server lacks something the framework needs (Node.js, Java, .NET, PHP, Composer, Go, Python…), the form shows it and offers a one-click **Install**.
 
-Each deploy, on the target server:
+| Framework | Runs as | What the panel does |
+|---|---|---|
+| React / Vue / Angular / Vite, plain HTML | **static files** | build, find the output folder (`dist`, `build`, `out`, Angular's `dist/<app>/browser`…), nginx serves it with client-side-routing fallback; no process |
+| Next.js, Nuxt, NestJS, Express / Fastify / any Node server | **service** | install, build, run as a systemd service on its own port behind nginx |
+| Spring Boot (Maven / Gradle) | **service** | build the jar (wrapper if present), `java -jar` on the assigned port |
+| .NET / ASP.NET Core | **service** | `dotnet publish`, run the published app on the assigned port |
+| Go, Python (Django / Flask / FastAPI), custom | **service** | build / virtualenv, run your start command on the assigned port |
+| Laravel, plain PHP / WordPress | **PHP-FPM** | `composer install`, optional asset build, shared `storage/`, database migrations *before* going live, PHP-FPM reload; files and artisan run as the web user |
 
-1. clones the branch into a fresh `releases/<timestamp>` folder (shallow, no `.git` kept), writes the `.env`, runs install and build (with the `.env` loaded);
-2. writes/updates a `panel-app-<name>.service` systemd unit, switches the `current` symlink atomically, restarts the service;
-3. waits for the health check (default: any HTTP answer below 500 within 30 s; configurable, optionally 2xx/3xx only);
-4. **if it fails, switches back to the previous release, restarts, and verifies that one is healthy again**: the deploy is reported as *rolled back* (or *failed* if the old version is also down, never silently "fine");
-5. prunes old releases (default keep 5, never the live or previous one).
+Each deploy, on the server: clones the branch into a fresh `releases/<timestamp>` folder (no `.git` kept), writes the `.env`, links shared folders, installs and builds (with the `.env` loaded), runs the release command (for Laravel: migrations; **a failure cancels the deploy before anything changes**), then atomically switches `current` (and `live` for static/PHP apps), restarts or reloads, and health-checks.
+**If the check fails it switches back to the previous release and verifies that one is healthy**: the deploy is reported as *rolled back* (or *failed* if the old version is down too, never silently "fine"). Old releases are pruned (default keep 5, never the live or previous one). A failed clone/install/build never touches what is live; one deploy per app at a time; every deploy keeps its log; **Releases** rolls back to any kept release (database changes are *not* reverted, and the log says so).
+Layout: `/srv/apps/<name>/{releases/, shared/{.env,storage…}, current, live}` (configurable). Build caches live in `shared/home` so repeat builds are fast.
 
-A failed clone/install/build never touches the running release. One deploy per app at a time. History keeps the log of every deploy; **Releases** lets you roll back to any kept release.
-Layout on the server: `/srv/apps/<name>/{releases/, shared/{.env,start.sh}, current}` (configurable per app).
+Health check: services over HTTP on their port (any answer below 500 by default, or strict 2xx/3xx); static sites check that the build produced an index file; PHP apps check through nginx if you give a health host name, otherwise that `index.php` exists.
 
-**Secrets** (git token / deploy key, env values) are encrypted in the panel's store and reach the server only inside the script sent over the SSH channel's stdin
-(never in a process command line); the deploy key and token helper exist only in a private temp directory for the duration of the clone. SSH deploy keys use `StrictHostKeyChecking=accept-new` (trust on first use) for the git host.
+**Secrets** (git token / deploy key, env values) are encrypted in the panel's store and reach the server only inside the script sent over the SSH channel's stdin (never in a process command line); the deploy key and token helper exist only in a private temp directory for the duration of the clone. SSH deploy keys use `StrictHostKeyChecking=accept-new` (trust on first use) for the git host.
 
-**Environment (.env) editor:** admins can **Reveal & edit** the whole file as `NAME=value` text (quotes, `#` and newlines are handled), then **Save** (next deploy) or
-**Save & apply now** (writes the file and restarts the service, no rebuild; you are told if the app does not come back healthy). Revealing values is audited; viewers only see variable names;
-values are never written to the audit log. `PORT` and `NODE_ENV` are set by the panel.
+**Environment (.env) editor:** admins can **Reveal & edit** the whole file as `NAME=value` text (quotes, `#` and newlines are handled), then **Save** (next deploy) or **Save & apply now** (writes the file and restarts the service / reloads PHP-FPM and refreshes Laravel's config cache; for static sites **Save & redeploy**, because they read variables at build time). You are told if the app does not come back healthy. Revealing values is audited; viewers only see variable names; values are never written to the audit log. `PORT` and `NODE_ENV` are set by the panel.
 
-**Webhook auto-deploy:** enable it on the app page to get a URL + secret. GitHub (push event, `application/json`, HMAC-SHA256 signature) or any CI (`curl -X POST <url>`) triggers a deploy of the app's branch;
-other branches/events are ignored, calls are rate-limited, rotating the secret invalidates the old one. The panel must be reachable from the internet at that URL (set `PANEL_PUBLIC_URL`
-behind a reverse proxy and expose only `/api/hooks/`).
+**Webhook auto-deploy:** enable it on the app page to get a URL + secret. GitHub (push event, `application/json`, HMAC-SHA256 signature) or any CI triggers a deploy of the app's branch; other branches/events are ignored, calls are rate-limited, rotating the secret invalidates the old one. The panel must be reachable from the internet at that URL (set `PANEL_PUBLIC_URL` behind a reverse proxy and expose only `/api/hooks/`).
+
+### Already running something? Adopt it as it is
+
+- **Existing nginx sites:** *Domains* lists hand-written nginx files it finds and offers **Add to panel**. The file is kept byte for byte (same name, same content): you get DNS and HTTPS checks, certificate status and a validated editor. Nothing is rewritten or duplicated; removing it from the panel leaves the file alone unless you ask to delete it.
+- **Existing Laravel apps:** *Deploy → PHP / Laravel apps → Add existing app* reads the app without running it (versions, git state, `.env` highlights without secrets, PHP-FPM user, queue workers, scheduler) and flags problems (debug on in production, missing vendor, storage owned by the wrong user, no queue worker…). Then: maintenance mode, a fixed list of safe artisan commands (clear/cache config, queue restart, migrate status/run…) always run as the owner of `storage/` so cache and log files keep the right owner, log viewer with filter, and a raw `.env` editor (comments and order kept, backup `.env.panel-bak`, owner and mode unchanged, `APP_KEY` removal needs confirmation). Destructive commands (`migrate:fresh`, rollback, `db:wipe`, `db:seed`) are deliberately not offered.
+- When you are ready, create a normal app from the same repository to move to panel-managed releases, health checks and rollback.
 
 ## Domains, HTTPS and nginx
 
@@ -109,7 +115,7 @@ Renewal is automatic through the `certbot-renew.timer` the panel installs (twice
 - Every save is written, checked with `nginx -t`, and reloaded; on failure the previous content is restored and nginx's error is shown. A `.panel-bak` copy of the previous version is kept.
 
 Requirements on the managed server: the SSH user needs **passwordless sudo** (default for `ec2-user`) for services, nginx and certbot; ports 80/443 open in the security group; DNS pointing at the instance (Elastic IP recommended).
-`PANEL_ENABLE_LOCAL` (managing the panel's own host with the limited sudoers rules from `--manage-local`) does not cover deploy/domains, which need broader sudo: manage hosts over SSH instead.
+`PANEL_PHP_SOCKET` (default `unix:/run/php-fpm/www.sock`) sets the PHP-FPM socket nginx talks to. `PANEL_ENABLE_LOCAL` (managing the panel's own host with the limited sudoers rules from `--manage-local`) does not cover deploy/domains, which need broader sudo: manage hosts over SSH instead.
 
 ## Install the panel on Amazon Linux 2023
 

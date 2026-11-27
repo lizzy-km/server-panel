@@ -83,6 +83,8 @@ async function makeTarget() {
   for (const name of ['systemctl', 'journalctl', 'certbot']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(bin, name)), fs.chmodSync(path.join(bin, name), 0o755);
   const nginxConf = path.join(dir, 'nginx/nginx.conf');
   fs.writeFileSync(nginxConf, `pid ${dir}/nginx/nginx.pid;\nerror_log ${dirs.logs}/error.log;\nevents { worker_connections 16; }\nhttp {\n  access_log off;\n  client_body_temp_path ${dirs.tmp}/b; proxy_temp_path ${dirs.tmp}/p; fastcgi_temp_path ${dirs.tmp}/f; uwsgi_temp_path ${dirs.tmp}/u; scgi_temp_path ${dirs.tmp}/s;\n  include ${dirs.conf}/*.conf;\n}\n`);
+  // `include fastcgi_params;` is resolved relative to the test nginx.conf
+  for (const f of ['fastcgi_params', 'mime.types']) { try { fs.copyFileSync(`/etc/nginx/${f}`, path.join(dir, 'nginx', f)); } catch { /* not installed */ } }
   const key = genKey(dir, 'id_ed25519');
   const sshd = await startSshd({
     authorizedKeys: [key.pub],
@@ -90,7 +92,7 @@ async function makeTarget() {
   });
   const overrides = {
     appsBaseDir: dirs.apps, unitDir: dirs.units, nginxConfDir: dirs.conf, nginxLogDir: dirs.logs, nginxConf,
-    letsencryptDir: dirs.le, acmeRoot: dirs.acme, allowLocalRepos: true,
+    letsencryptDir: dirs.le, acmeRoot: dirs.acme, allowLocalRepos: true, phpSocket: `unix:${dir}/php-fpm.sock`,
   };
   return { dir, dirs, state, key, sshd, overrides, stop() { sshd.stop(); try { for (const f of fs.readdirSync(state)) if (f.endsWith('.pid')) { try { process.kill(Number(fs.readFileSync(path.join(state, f), 'utf8')), 'SIGKILL'); } catch { /* gone */ } } } catch { /* ignore */ } fs.rmSync(dir, { recursive: true, force: true }); } };
 }

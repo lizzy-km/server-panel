@@ -28,6 +28,7 @@ function loadConfig(env = process.env) {
     nginxLogDir: env.PANEL_NGINX_LOG_DIR || '/var/log/nginx',
     nginxConf: env.PANEL_NGINX_CONF || '', // pass `-c <file>` to nginx (tests)
     letsencryptDir: env.PANEL_LETSENCRYPT_DIR || '/etc/letsencrypt',
+    phpSocket: env.PANEL_PHP_SOCKET || 'unix:/run/php-fpm/www.sock', // PHP-FPM socket nginx talks to
     acmeRoot: env.PANEL_ACME_ROOT || '/var/www/letsencrypt',
     allowLocalRepos: bool(env.PANEL_ALLOW_LOCAL_REPOS, false), // file:// repositories (tests only)
     publicUrl: (env.PANEL_PUBLIC_URL || '').replace(/\/+$/, ''), // used to display webhook URLs

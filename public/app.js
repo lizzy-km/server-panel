@@ -294,7 +294,9 @@ function authScreen(setup) {
   const err = h('div', { class: 'err', role: 'alert' });
   const user = h('input', { id: 'u', autocomplete: 'username', required: true });
   const pass = h('input', { id: 'p', type: 'password', autocomplete: setup ? 'new-password' : 'current-password', required: true });
-  const token = setup ? h('input', { id: 't', autocomplete: 'off', required: true, placeholder: 'Printed in the server console' }) : null;
+  const fromUrl = (location.hash.match(/^#setup=([A-Za-z0-9]+)$/) || [])[1] || '';
+  const token = setup ? h('input', { id: 't', autocomplete: 'off', required: true, value: fromUrl, placeholder: 'Printed in the server console' }) : null;
+  if (fromUrl) history.replaceState(null, '', location.pathname); // the token is single use; do not leave it in the address bar
   const btn = h('button', { class: 'primary', type: 'submit' }, setup ? 'Create admin account' : 'Sign in');
   const form = h('form', {
     onsubmit: async (e) => {
@@ -307,7 +309,7 @@ function authScreen(setup) {
   },
     h('div', { class: 'field' }, h('label', { for: 'u' }, 'Username'), user),
     h('div', { class: 'field' }, h('label', { for: 'p' }, 'Password'), pass),
-    token ? h('div', { class: 'field' }, h('label', { for: 't' }, 'Setup token'), token) : null,
+    token ? (fromUrl ? h('div', { class: 'muted', style: { fontSize: '12.5px', marginBottom: '10px' } }, '✓ Setup token filled in automatically.') : h('div', { class: 'field' }, h('label', { for: 't' }, 'Setup token'), token)) : null,
     err, btn);
   return h('div', { class: 'auth' }, h('div', { class: 'card' },
     h('h1', {}, setup ? 'Welcome — set up your panel' : 'Server Panel'),

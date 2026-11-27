@@ -101,21 +101,30 @@ function readinessCard() {
     box.replaceChildren(h('h2', {}, 'Server readiness'), h('div', { class: 'muted' }, 'Checking…'));
     let r;
     try { r = await api('/api/provision/status'); } catch (e) { box.replaceChildren(h('h2', {}, 'Server readiness'), h('div', { class: 'notice' }, e.message)); return; }
-    const labels = { git: 'git', node: 'Node.js', npm: 'npm', nginx: 'nginx', certbot: 'certbot', curl: 'curl' };
-    const missing = ['git', 'node', 'nginx', 'certbot'].filter((t) => !r.tools[t].installed);
+    const core = ['git', 'nginx', 'certbot'];
+    const runtimes = ['node', 'php', 'composer', 'java', 'maven', 'dotnet', 'go', 'python'];
+    const missingCore = core.filter((t) => !r.tools[t].installed);
+    const chip = (k, optional) => {
+      const t = r.tools[k]; const ok = t.installed;
+      const el = h('span', { class: 'chip ' + (ok ? 'ok' : optional ? '' : 'bad'), title: ok ? 'installed' : (isAdminUser() ? 'click to install' : 'not installed'), style: !ok && isAdminUser() ? { cursor: 'pointer' } : {} },
+        ok ? '✓' : optional ? '＋' : '✕', ` ${TOOL_LABEL[k] || k}`, t.version ? h('span', { class: 'muted' }, ` ${t.version}`) : null);
+      if (!ok && isAdminUser()) el.addEventListener('click', () => installDialog([k], load));
+      return el;
+    };
     box.replaceChildren(
-      h('h2', {}, 'Server readiness', isAdminUser() && missing.length ? h('button', { class: 'sm primary', onclick: () => installDialog(missing, load) }, 'Install missing…') : h('button', { class: 'sm', onclick: load }, 'Re-check')),
-      h('div', { class: 'chips' }, Object.entries(labels).map(([k, label]) => h('span', { class: 'chip ' + (r.tools[k].installed ? 'ok' : 'bad') }, r.tools[k].installed ? '✓' : '✕', ` ${label}`, r.tools[k].version ? h('span', { class: 'muted' }, ` ${r.tools[k].version}`) : null)),
-        h('span', { class: 'chip ' + (r.sudo === 'no' ? 'bad' : 'ok') }, r.sudo === 'no' ? '✕ passwordless sudo' : '✓ ' + (r.sudo === 'root' ? 'root' : 'sudo'))),
+      h('h2', {}, 'Server readiness', isAdminUser() && missingCore.length ? h('button', { class: 'sm primary', onclick: () => installDialog(missingCore, load) }, 'Install missing…') : h('button', { class: 'sm', onclick: load }, 'Re-check')),
+      h('div', { class: 'chips' }, core.map((k) => chip(k, false)), h('span', { class: 'chip ' + (r.sudo === 'no' ? 'bad' : 'ok') }, r.sudo === 'no' ? '✕ passwordless sudo' : '✓ ' + (r.sudo === 'root' ? 'root' : 'sudo'))),
+      h('div', { class: 'muted', style: { margin: '10px 0 6px', fontSize: '12.5px' } }, 'Runtimes for your apps (click a missing one to install it; the new-app form also offers this automatically):'),
+      h('div', { class: 'chips' }, runtimes.map((k) => chip(k, true))),
       r.sudo === 'no' ? h('div', { class: 'alert', style: { marginTop: '10px' } }, `User “${r.user}” has no passwordless sudo, so deploys cannot create services and nginx/certificates cannot be managed.`) : null,
-      missing.length && !isAdminUser() ? h('div', { class: 'muted', style: { marginTop: '8px' } }, 'Ask an administrator to install the missing tools.') : null);
+      missingCore.length && !isAdminUser() ? h('div', { class: 'muted', style: { marginTop: '8px' } }, 'Ask an administrator to install the missing tools.') : null);
   }
   load();
   return box;
 }
 
 function installDialog(missing, onFinished) {
-  const names = { git: 'git (clone repositories)', node: 'Node.js + npm (build and run apps)', nginx: 'nginx (web server / reverse proxy)', certbot: "certbot (free Let's Encrypt certificates, auto-renewal)" };
+  const names = { git: 'git (clone repositories)', node: 'Node.js + npm (React, Vue, Angular, Next.js, Nest, Express…)', nginx: 'nginx (web server / reverse proxy)', certbot: "certbot (free Let's Encrypt certificates, auto-renewal)", java: 'Java 21 (Amazon Corretto) for Spring Boot', maven: 'Maven (Spring builds without a wrapper)', dotnet: '.NET SDK 8 for ASP.NET Core', php: 'PHP 8.3 + PHP-FPM (set up to work with nginx)', composer: 'Composer (PHP packages)', go: 'Go', python: 'Python 3 + pip' };
   const boxes = Object.fromEntries(missing.map((t) => [t, h('input', { type: 'checkbox', checked: true })]));
   const body = h('div', {}, h('p', { class: 'muted' }, 'Installs with dnf on Amazon Linux 2023. This changes the server; nginx is started and enabled. Remember to open ports 80 and 443 in the instance’s security group.'),
     missing.map((t) => h('label', { class: 'row', style: { margin: '6px 0' } }, boxes[t], names[t])));
@@ -127,61 +136,145 @@ function installDialog(missing, onFinished) {
 }
 
 // ---------------------------------------------------------------- app form (create + settings)
-function appForm(app, apps) {
+let PRESET_LIST = null;
+async function loadPresets() { if (!PRESET_LIST) PRESET_LIST = (await api('/api/presets')).presets; return PRESET_LIST; }
+const TOOL_LABEL = { git: 'git', node: 'Node.js', java: 'Java', maven: 'Maven', dotnet: '.NET SDK', php: 'PHP + PHP-FPM', composer: 'Composer', go: 'Go', python: 'Python', nginx: 'nginx', certbot: 'certbot' };
+const MODE_TEXT = {
+  service: 'Runs as a background service on its own port; nginx forwards visitors to it.',
+  static: 'Built once, then the files are served directly by nginx (no process to run).',
+  php: 'Runs under PHP-FPM; nginx hands PHP requests to it (no separate process).',
+};
+
+/** Which tools a framework needs and whether the server has them; one click installs what is missing. */
+function requirementsBar(preset, tools, onInstalled) {
+  const need = ['git', ...(preset.tools || [])];
+  const box = h('div', { class: 'req' });
+  const missing = need.filter((t) => !(tools[t] && tools[t].installed));
+  box.append(h('span', { class: 'muted', style: { fontSize: '12.5px' } }, 'This server needs:'),
+    ...need.map((t) => h('span', { class: 'chip ' + (tools[t] && tools[t].installed ? 'ok' : 'bad') }, tools[t] && tools[t].installed ? '✓' : '✕', ` ${TOOL_LABEL[t] || t}`, tools[t] && tools[t].version ? h('span', { class: 'muted' }, ` ${tools[t].version}`) : null)));
+  if (missing.length && isAdminUser()) box.append(h('button', { class: 'sm primary', type: 'button', onclick: async () => {
+    try { const r = await api('/api/provision/install', { method: 'POST', body: { tools: missing } }); logModal(`Installing ${missing.map((t) => TOOL_LABEL[t] || t).join(', ')}`, { url: `/api/jobs/log?id=${r.id}`, onDone: onInstalled }); } catch (e) { fail(e); }
+  } }, `Install ${missing.map((t) => TOOL_LABEL[t] || t).join(' + ')}`));
+  else if (!missing.length) box.append(h('span', { class: 'badge ok' }, 'ready'));
+  return box;
+}
+
+/**
+ * The app form. New app: paste a repository, detect or pick a framework, see what the server needs, go.
+ * Raw commands live under "Advanced" and only override the framework's defaults.
+ */
+function appForm(app, apps, presets, tools) {
   const isNew = !app;
-  const a = app || { branch: 'main', authType: 'none', healthPath: '/', healthTimeout: 30, keepReleases: 5, tokenUser: 'x-access-token' };
+  const a = app || { branch: 'main', authType: 'none', healthPath: '/', healthTimeout: 30, keepReleases: 5, tokenUser: 'x-access-token', framework: 'node' };
+  let framework = a.framework || 'node';
+  const preset = () => presets.find((p) => p.id === framework) || presets[0];
   const f = {
     name: h('input', { value: a.name || '', placeholder: 'my-app', disabled: !isNew }),
-    repoUrl: h('input', { value: a.repoUrl || '', placeholder: 'https://github.com/org/repo.git or git@github.com:org/repo.git' }),
+    repoUrl: h('input', { value: a.repoUrl || '', placeholder: 'https://github.com/org/repo.git  or  git@github.com:org/repo.git' }),
     branch: h('input', { value: a.branch }),
-    authType: h('select', {}, [['none', 'Public repository (no credentials)'], ['token', 'Access token (HTTPS)'], ['key', 'Deploy key (SSH)']].map(([v, l]) => h('option', { value: v, selected: v === a.authType }, l))),
+    authType: h('select', {}, [['none', 'Public repository'], ['token', 'Private: access token'], ['key', 'Private: deploy key']].map(([v, l]) => h('option', { value: v, selected: v === a.authType }, l))),
     tokenUser: h('input', { value: a.tokenUser, placeholder: 'x-access-token' }),
-    secret: h('textarea', { rows: 4, spellcheck: false, placeholder: a.hasGitSecret ? '(unchanged — paste to replace)' : '' }),
+    secret: h('textarea', { rows: 4, spellcheck: false, placeholder: a.hasGitSecret ? '(unchanged: paste to replace)' : '' }),
     port: h('input', { type: 'number', value: a.port || suggestPort(apps), min: 1024, max: 65535 }),
-    installCmd: h('input', { value: a.installCmd || '', placeholder: 'default: npm ci (or npm install without a lockfile)' }),
-    buildCmd: h('input', { value: a.buildCmd || '', placeholder: 'default: npm run build, if the project has a build script' }),
-    startCmd: h('input', { value: a.startCmd || '', placeholder: 'default: npm start' }),
-    healthPath: h('input', { value: a.healthPath }),
-    healthTimeout: h('input', { type: 'number', value: a.healthTimeout, min: 5, max: 300 }),
-    healthStrict: h('input', { type: 'checkbox', checked: !!a.healthStrict }),
+    spa: h('input', { type: 'checkbox', checked: a.spa !== false }),
+    outputDir: h('input', { value: a.outputDir || '', placeholder: 'auto-detect (dist, build, out…)' }),
+    migrate: h('input', { type: 'checkbox', checked: a.releaseCmd === null || a.releaseCmd === undefined || a.releaseCmd !== '' }),
+    sharedPaths: h('input', { value: (a.sharedPaths || preset().sharedPaths || []).join(', '), placeholder: 'storage' }),
+    installCmd: h('input', { value: a.installCmd || '' }), buildCmd: h('input', { value: a.buildCmd || '' }), startCmd: h('input', { value: a.startCmd || '' }),
+    releaseCmd: h('input', { value: a.releaseCmd || '' }), afterCmd: h('input', { value: a.afterCmd || '' }),
+    healthPath: h('input', { value: a.healthPath }), healthHost: h('input', { value: a.healthHost || '', placeholder: 'e.g. app.example.com (PHP apps: checks through nginx)' }),
+    healthTimeout: h('input', { type: 'number', value: a.healthTimeout, min: 5, max: 300 }), healthStrict: h('input', { type: 'checkbox', checked: !!a.healthStrict }),
     keepReleases: h('input', { type: 'number', value: a.keepReleases, min: 2, max: 30 }),
-    runAs: h('input', { value: a.runAs || '', placeholder: 'default: the SSH user' }),
-    extraPath: h('input', { value: a.extraPath || '', placeholder: 'e.g. /home/ec2-user/.nvm/versions/node/v22.0.0/bin' }),
+    runAs: h('input', { value: a.runAs || '', placeholder: 'default: the SSH user (PHP apps: nginx)' }),
+    extraPath: h('input', { value: a.extraPath || '', placeholder: 'e.g. /opt/tools/bin' }),
     baseDir: h('input', { value: a.baseDir || '/srv/apps', disabled: !isNew }),
-    env: h('textarea', { rows: 5, spellcheck: false, placeholder: 'NODE_OPTIONS=--max-old-space-size=512\nDATABASE_URL=postgres://…' }),
+    env: h('textarea', { rows: 4, spellcheck: false, placeholder: 'NODE_OPTIONS=--max-old-space-size=512\nDATABASE_URL=postgres://…' }),
   };
   const field = (label, el, hint) => h('div', { class: 'field' }, h('label', {}, label), el, hint ? h('div', { class: 'muted', style: { fontSize: '12px' } }, hint) : null);
-  const secretBox = field('', h('div', {}));
+  const secretBox = h('div', {});
   const syncAuth = () => {
     const t = f.authType.value;
     secretBox.replaceChildren(...(t === 'none' ? [] : [
-      ...(t === 'token' ? [field('Token username', f.tokenUser, 'GitHub: x-access-token (fine-grained or classic personal access token with read access to the repo)')] : []),
-      field(t === 'token' ? 'Access token' : 'Deploy key (private key)', f.secret, t === 'key' ? 'Add the matching public key as a read-only deploy key in the repository. It is stored encrypted and only written to the server for the duration of a clone.' : 'Stored encrypted. Never shown again.'),
+      ...(t === 'token' ? [field('Token username', f.tokenUser, 'GitHub: x-access-token')] : []),
+      field(t === 'token' ? 'Access token' : 'Deploy key (private key)', f.secret, t === 'key' ? 'Add the matching public key as a read-only deploy key on the repository. Stored encrypted.' : 'A personal access token with read access to the repository. Stored encrypted, never shown again.'),
     ]));
   };
   f.authType.addEventListener('change', syncAuth); syncAuth();
+
+  // ---- framework picker
+  const picker = h('div', { class: 'fw-grid' });
+  const info = h('div', { class: 'muted', style: { fontSize: '12.5px', marginBottom: '6px' } });
+  const req = h('div', {});
+  const modeFields = h('div', {});
+  const placeholders = () => { const p = preset(); for (const [k, v] of [['installCmd', p.install], ['buildCmd', p.build], ['startCmd', p.start], ['releaseCmd', p.releaseCmd], ['afterCmd', p.afterCmd], ['outputDir', p.outputDir === 'auto' ? 'auto-detect' : p.outputDir]]) f[k].placeholder = v ? `default: ${String(v).slice(0, 90)}` : 'default: none'; f.healthPath.placeholder = p.healthPath || '/'; };
+  function drawPicker() {
+    const groups = [...new Set(presets.map((p) => p.group))];
+    picker.replaceChildren(...groups.flatMap((g) => [h('div', { class: 'fw-group' }, g), ...presets.filter((p) => p.group === g).map((p) => h('button', {
+      type: 'button', class: 'fw-card' + (p.id === framework ? ' sel' : ''), disabled: !isNew, 'aria-pressed': p.id === framework,
+      onclick: () => { framework = p.id; refresh(); },
+    }, h('span', { class: 'ic' }, p.icon), h('span', {}, h('div', { class: 't' }, p.label), h('div', { class: 'm' }, p.mode === 'service' ? 'service' : p.mode === 'static' ? 'static files' : 'PHP-FPM'))))]));
+  }
+  function drawMode() {
+    const p = preset();
+    modeFields.replaceChildren(...(p.mode === 'service' ? [field('Port', f.port, 'The port your app listens on. The panel passes it to your app as the PORT environment variable.')]
+      : p.mode === 'static' ? [h('label', { class: 'row', style: { margin: '4px 0 8px' } }, f.spa, 'Single-page app: send unknown URLs to index.html (React Router, Vue Router, Angular routes)'), field('Output folder', f.outputDir, 'Where the build puts the website. Leave empty to detect it (dist, build, out, Angular’s dist/<app>/browser…).')]
+        : [...(p.id === 'laravel' ? [h('label', { class: 'row', style: { margin: '4px 0 8px' } }, f.migrate, 'Run database migrations on every deploy (php artisan migrate --force, before the new version goes live)')] : []),
+          field('Folders kept between releases', f.sharedPaths, 'Uploads, logs and caches that must survive a deploy (Laravel: storage). Comma separated.')]));
+  }
+  function refresh() {
+    const p = preset();
+    drawPicker(); drawMode(); placeholders();
+    info.textContent = `${p.description} ${MODE_TEXT[p.mode]}`;
+    req.replaceChildren(tools ? requirementsBar(p, tools, async () => { try { const t = (await api('/api/provision/status')).tools; Object.assign(tools, t); } catch { /* ignore */ } refresh(); }) : '');
+  }
+
+  // ---- detection
+  const detectBtn = h('button', { type: 'button' }, 'Detect framework from the repository');
+  const detectMsg = h('span', { class: 'muted', style: { marginLeft: '10px', fontSize: '12.5px' } });
+  detectBtn.onclick = act(detectBtn, async () => {
+    detectMsg.textContent = 'Looking inside the repository…';
+    try {
+      const body = { repoUrl: f.repoUrl.value.trim(), branch: f.branch.value.trim() || 'main', authType: f.authType.value, tokenUser: f.tokenUser.value.trim() || 'x-access-token' };
+      if (body.authType !== 'none') body.gitSecret = f.secret.value.trim();
+      const r = await api('/api/apps/detect', { method: 'POST', body });
+      framework = r.preset; refresh(); detectMsg.textContent = `Detected: ${r.label}`;
+    } catch (e) { detectMsg.textContent = ''; fail(e); }
+  });
+
+  const cmds = h('details', { class: 'adv' }, h('summary', {}, 'Advanced: override commands (only if the defaults do not fit)'),
+    field('Install command', f.installCmd), field('Build command', f.buildCmd), field('Start command', f.startCmd, 'Services only. Must listen on $PORT.'),
+    field('Release command (runs before going live; a failure cancels the deploy)', f.releaseCmd), field('After-deploy command (runs once live)', f.afterCmd));
   const el = h('div', {},
-    isNew ? h('div', { class: 'grid2' }, field('App name', f.name, 'Lowercase letters, digits, dashes'), field('Port', f.port, 'The port your app listens on (given as $PORT)')) : field('Port', f.port),
-    field('Git repository URL', f.repoUrl),
-    h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Authentication', f.authType)),
-    secretBox,
-    h('details', { class: 'adv', open: isNew }, h('summary', {}, 'Build and run'),
-      field('Install command', f.installCmd), field('Build command', f.buildCmd), field('Start command', f.startCmd, 'Runs from the release folder as a systemd service; your app must listen on $PORT')),
-    h('details', { class: 'adv' }, h('summary', {}, 'Health check and releases'),
+    isNew ? h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox,
+      h('div', { class: 'row', style: { margin: '0 0 10px' } }, detectBtn, detectMsg)) : h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox),
+    h('div', { class: 'field' }, h('label', {}, isNew ? 'Framework' : 'Framework (fixed after creation)'), picker), info, isNew ? req : '',
+    modeFields,
+    isNew ? h('div', { class: 'grid2' }, field('App name', f.name, 'Lowercase letters, digits, dashes'), h('div', {})) : '',
+    cmds,
+    h('details', { class: 'adv' }, h('summary', {}, 'Advanced: health check, releases, user'),
       h('div', { class: 'grid2' }, field('Health check path', f.healthPath), field('Wait up to (seconds)', f.healthTimeout)),
-      h('label', { class: 'row', style: { margin: '4px 0 12px' } }, f.healthStrict, 'Require a 2xx/3xx answer (otherwise any answer below 500 counts as healthy)'),
-      field('Releases to keep', f.keepReleases)),
-    h('details', { class: 'adv' }, h('summary', {}, 'Advanced'),
-      h('div', { class: 'grid2' }, field('Service user', f.runAs), field('Apps directory', f.baseDir)),
-      field('Extra PATH (e.g. nvm node)', f.extraPath)),
-    isNew ? field('Environment variables (optional)', f.env, 'One NAME=value per line. Stored encrypted; values are never shown again.') : null);
+      field('Health check host name (PHP apps)', f.healthHost, 'PHP apps are checked through nginx on port 80 with this host name. Leave empty to only check that the site files exist.'),
+      h('label', { class: 'row', style: { margin: '4px 0 12px' } }, f.healthStrict, 'Require a 2xx/3xx answer (otherwise anything below 500 counts as healthy)'),
+      h('div', { class: 'grid2' }, field('Releases to keep', f.keepReleases), field('Run as Linux user', f.runAs)),
+      h('div', { class: 'grid2' }, field('Apps directory', f.baseDir), field('Extra PATH', f.extraPath))),
+    isNew ? field('Environment variables (optional)', f.env, 'One NAME=value per line. Stored encrypted; values are never shown again unless an admin reveals them.') : null);
+  refresh();
+
   const read = () => {
+    const p = preset();
     const body = {
-      repoUrl: f.repoUrl.value.trim(), branch: f.branch.value.trim(), authType: f.authType.value, port: Number(f.port.value),
-      installCmd: f.installCmd.value, buildCmd: f.buildCmd.value, startCmd: f.startCmd.value, healthPath: f.healthPath.value.trim() || '/',
-      healthTimeout: Number(f.healthTimeout.value), healthStrict: f.healthStrict.checked, keepReleases: Number(f.keepReleases.value),
-      runAs: f.runAs.value.trim(), extraPath: f.extraPath.value.trim(),
+      repoUrl: f.repoUrl.value.trim(), branch: f.branch.value.trim(), authType: f.authType.value, framework,
+      installCmd: f.installCmd.value, buildCmd: f.buildCmd.value, startCmd: f.startCmd.value, afterCmd: f.afterCmd.value,
+      healthPath: f.healthPath.value.trim() || '/', healthHost: f.healthHost.value.trim(), healthTimeout: Number(f.healthTimeout.value), healthStrict: f.healthStrict.checked,
+      keepReleases: Number(f.keepReleases.value), runAs: f.runAs.value.trim(), extraPath: f.extraPath.value.trim(),
     };
+    // an empty command means "use the framework default", so do not send it
+    for (const k of ['installCmd', 'buildCmd', 'startCmd', 'afterCmd']) if (!body[k]) delete body[k];
+    if (f.releaseCmd.value) body.releaseCmd = f.releaseCmd.value;
+    else if (p.id === 'laravel') body.releaseCmd = f.migrate.checked ? undefined : '';
+    if (p.mode === 'service') body.port = Number(f.port.value);
+    if (p.mode === 'static') { body.spa = f.spa.checked; body.outputDir = f.outputDir.value.trim(); }
+    if (p.mode === 'php') body.sharedPaths = f.sharedPaths.value;
     if (isNew) { body.name = f.name.value.trim(); body.baseDir = f.baseDir.value.trim(); }
     if (body.authType === 'token') body.tokenUser = f.tokenUser.value.trim() || 'x-access-token';
     if (body.authType !== 'none' && f.secret.value.trim()) body.gitSecret = f.secret.value.trim();
@@ -192,33 +285,38 @@ function appForm(app, apps) {
 }
 const suggestPort = (apps) => { const used = new Set((apps || []).map((x) => x.port)); let p = 3000; while (used.has(p)) p += 1; return p; };
 
-function newAppDialog(apps, onCreated) {
-  const form = appForm(null, apps);
-  const err = h('div', { class: 'alert crit hidden', role: 'alert' });
+async function newAppDialog(apps, onCreated) {
+  let presets; let tools = null;
+  try { presets = await loadPresets(); } catch (e) { return fail(e); }
+  try { tools = (await api('/api/provision/status')).tools; } catch { tools = null; }
+  const form = appForm(null, apps, presets, tools);
+  const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
   const create = h('button', { class: 'primary' }, 'Create app');
   const close = modal('New app', h('div', {}, err, form.el, h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Cancel'), create)), { wide: true });
   create.onclick = act(create, async () => {
     err.classList.add('hidden');
-    try { const r = await api('/api/apps', { method: 'POST', body: form.read() }); close(); toast(`Created ${r.app.name}. Deploy it from the app page.`); onCreated(r.app); }
+    try { const r = await api('/api/apps', { method: 'POST', body: form.read() }); close(); toast(`Created ${r.app.name}. Click Deploy to publish it.`); onCreated(r.app); }
     catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
   });
 }
 
 // ---------------------------------------------------------------- list page
 function pageDeploy() {
-  const arg = routeArgs()[0];
-  if (arg) return pageAppDetail(arg);
+  const args = routeArgs();
+  if (args[0] === 'laravel' && args[1]) return pageLaravelDetail(args[1]);
+  if (args[0]) return pageAppDetail(args[0]);
   const admin = isAdminUser();
   const box = h('div', { class: 'card' });
   let apps = [];
   async function load() {
+    await loadPresets();
     const r = await api('/api/apps');
     apps = r.apps;
     box.replaceChildren(h('h2', {}, `Apps (${apps.length})`), apps.length ? dataTable({
       columns: [
         { key: 'name', label: 'App', render: (x) => h('a', { href: `#/deploy/${x.id}` }, x.name) },
         { key: 'repoUrl', label: 'Source', render: (x) => h('span', { class: 'mono' }, `${x.repoUrl.replace(/^https:\/\//, '').replace(/\.git$/, '')} @ ${x.branch}`) },
-        { key: 'port', label: 'Port', num: true },
+        { key: 'framework', label: 'Framework', render: (x) => { const p = PRESET_LIST.find((q) => q.id === x.framework) || {}; return h('span', {}, `${p.icon || ''} ${(p.label || x.framework).replace(/ \(.*\)$/, '')}`, h('span', { class: 'muted' }, x.mode === 'service' ? ` · port ${x.port}` : x.mode === 'static' ? ' · static files' : ' · PHP-FPM')); } },
         { key: 'lastDeploy', label: 'Last deploy', sortable: false, render: (x) => (x.lastDeploy ? h('span', {}, deployBadge(x.lastDeploy.status), ' ', h('span', { class: 'muted' }, `${shortSha(x.lastDeploy.commit)} · ${ago(x.lastDeploy.startedAt)}`)) : h('span', { class: 'muted' }, 'never')) },
       ],
       rows: apps, empty: '',
@@ -230,7 +328,7 @@ function pageDeploy() {
   poll(load, 8000);
   return h('div', {}, pageHeader('Deploy', `Node.js apps on ${(currentServer() || {}).name || 'this server'}: Git → build → zero-downtime switch → health check → auto-rollback`,
     admin ? h('button', { class: 'primary', onclick: () => newAppDialog(apps, (a) => { location.hash = `#/deploy/${a.id}`; }) }, 'New app') : null),
-    readinessCard(), box);
+    readinessCard(), laravelCard(), box);
 }
 
 async function deployNow(app, after) {
@@ -248,6 +346,7 @@ function pageAppDetail(id) {
   let tabId = 'overview';
 
   async function load(rerender = true) {
+    await loadPresets();
     data = await api(`/api/apps/detail?id=${encodeURIComponent(id)}`);
     drawHead();
     if (rerender) drawTabs();
@@ -260,10 +359,10 @@ function pageAppDetail(id) {
     const act1 = (label, fn, cls = '') => { const b = h('button', { class: cls }, label); b.onclick = act(b, fn); return b; };
     head.replaceChildren(h('div', { class: 'muted', style: { marginBottom: '6px' } }, h('a', { href: '#/deploy' }, '← All apps')),
       pageHeader(app.name, `${app.repoUrl.replace(/\.git$/, '')} @ ${app.branch}`,
-        h('span', { class: 'badge ' + (status.active === 'active' ? 'ok' : status.active === 'inactive' || status.active === 'failed' ? 'bad' : '') }, `service ${status.active}`),
+        h('span', { class: 'badge ' + (['active', 'serving'].includes(status.active) ? 'ok' : ['inactive', 'failed', 'broken'].includes(status.active) ? 'bad' : '') }, app.mode === 'service' ? `service ${status.active}` : status.active),
         admin ? act1('Deploy now', async () => { await deployNow(app, () => load()); }, 'primary') : null,
-        admin ? act1('Restart', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: 'restart' } }); toast('Restarted'); await load(false); drawHead(); }) : null,
-        admin ? act1(status.active === 'active' ? 'Stop' : 'Start', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: status.active === 'active' ? 'stop' : 'start' } }); await load(false); drawHead(); }, status.active === 'active' ? 'danger' : '') : null));
+        admin && app.mode === 'service' ? act1('Restart', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: 'restart' } }); toast('Restarted'); await load(false); drawHead(); }) : null,
+        admin && app.mode === 'service' ? act1(status.active === 'active' ? 'Stop' : 'Start', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: status.active === 'active' ? 'stop' : 'start' } }); await load(false); drawHead(); }, status.active === 'active' ? 'danger' : '') : null));
   }
 
   function drawTabs() {
@@ -273,7 +372,7 @@ function pageAppDetail(id) {
       { id: 'releases', label: `Releases (${data.releases.length})`, render: releases },
       { id: 'env', label: `Environment (${data.app.envNames.length})`, render: environment },
       { id: 'settings', label: 'Settings', render: settings },
-      ...(isAdminUser() ? [{ id: 'logs', label: 'Service logs', render: serviceLogs }] : []),
+      ...(isAdminUser() && data.app.mode === 'service' ? [{ id: 'logs', label: 'Service logs', render: serviceLogs }] : []),
     ], tabId, (picked) => { tabId = picked; }));
   }
 
@@ -283,10 +382,11 @@ function pageAppDetail(id) {
     const last = deploys[0];
     const webhook = isAdminUser() ? webhookCard() : null;
     return h('div', { class: 'two' },
-      h('div', { class: 'card' }, h('h2', {}, 'Service'), kv([
-        ['State', h('span', { class: 'badge ' + (status.active === 'active' ? 'ok' : 'bad') }, status.active)],
-        ['Unit', h('code', {}, app.unit)], ['Since', status.since || '–'], ['PID', status.pid || '–'],
-        ['Memory', status.memory ? fmt.bytes(status.memory) : '–'], ['Restarts', String(status.restarts)], ['Listens on', `127.0.0.1:${app.port}`],
+      h('div', { class: 'card' }, h('h2', {}, app.mode === 'service' ? 'Service' : app.mode === 'static' ? 'Website' : 'PHP application'), kv([
+        ['Framework', (PRESET_LIST.find((p) => p.id === app.framework) || {}).label || app.framework],
+        ['State', h('span', { class: 'badge ' + (['active', 'serving'].includes(status.active) ? 'ok' : 'bad') }, status.active)],
+        ...(app.mode === 'service' ? [['Unit', h('code', {}, app.unit)], ['Since', status.since || '–'], ['PID', status.pid || '–'], ['Memory', status.memory ? fmt.bytes(status.memory) : '–'], ['Restarts', String(status.restarts)], ['Listens on', `127.0.0.1:${app.port}`]]
+          : [['Served from', h('code', {}, status.serving || '–')], ['How', app.mode === 'static' ? 'nginx serves the files directly' : 'nginx + PHP-FPM']]),
         ['Domains', sites.length ? h('span', {}, sites.map((s, i) => [i ? ', ' : '', h('a', { href: `#/domains/${s.id}` }, s.domain), s.https ? ' 🔒' : ''])) : h('span', { class: 'muted' }, 'none yet — add one on the Domains page')],
       ])),
       h('div', { class: 'card' }, h('h2', {}, 'Current release'), current ? kv([
@@ -363,7 +463,8 @@ function pageAppDetail(id) {
     const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
     const reveal = h('button', { class: 'primary' }, 'Reveal & edit');
     const save = h('button', { class: 'hidden' }, 'Save');
-    const apply = h('button', { class: 'primary hidden' }, 'Save & apply now');
+    const isStatic = app.mode === 'static';
+    const apply = h('button', { class: 'primary hidden' }, isStatic ? 'Save & redeploy' : 'Save & apply now');
     const cancel = h('button', { class: 'hidden' }, 'Cancel');
     const show = (msg) => { err.textContent = msg; err.classList.toggle('hidden', !msg); };
     const lock = () => { area.disabled = true; area.value = ''; for (const b of [save, apply, cancel]) b.classList.add('hidden'); reveal.classList.remove('hidden'); show(''); };
@@ -378,10 +479,11 @@ function pageAppDetail(id) {
     apply.onclick = act(apply, async () => {
       try {
         await persist();
-        apply.textContent = 'Restarting…';
+        if (isStatic) { const d = await api('/api/apps/deploy', { method: 'POST', body: { id } }); logModal(`Rebuilding ${app.name}`, { url: `/api/deploys/log?id=${d.deploy.id}`, onDone: () => load() }); return; }
+        apply.textContent = 'Applying…';
         const r = await api('/api/apps/env/apply', { method: 'POST', body: { id } });
-        toast('Saved and applied: the app restarted and is healthy'); void r; await load(false); drawHead();
-      } catch (e) { show(e.message); } finally { apply.textContent = 'Save & apply now'; }
+        toast(app.mode === 'php' ? 'Saved and applied: config cache refreshed, PHP-FPM reloaded' : 'Saved and applied: the app restarted and is healthy'); void r; await load(false); drawHead();
+      } catch (e) { show(e.message); } finally { apply.textContent = isStatic ? 'Save & redeploy' : 'Save & apply now'; }
     });
     card.append(
       h('div', { class: 'muted', style: { marginBottom: '10px' } }, 'This is the app’s .env file: one NAME=value per line. Use "double quotes" for values with spaces, # or \\n for new lines. Revealing values is recorded in the audit log.'),
@@ -394,7 +496,7 @@ function pageAppDetail(id) {
   function settings() {
     const { app } = data;
     const admin = isAdminUser();
-    const form = appForm(app, []);
+    const form = appForm(app, [], PRESET_LIST || [], null);
     const err = h('div', { class: 'alert crit hidden', role: 'alert' });
     const save = h('button', { class: 'primary' }, 'Save settings');
     save.onclick = act(save, async () => {

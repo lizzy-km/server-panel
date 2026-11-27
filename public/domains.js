@@ -95,6 +95,30 @@ function nginxFilesDialog(onSaved) {
   refresh('nginx.conf').catch((e) => show(e.message));
 }
 
+// ---------------------------------------------------------------- existing nginx sites found on the server
+function discoveryCard(onAdopted) {
+  const box = h('div', { class: 'card', style: { marginBottom: '14px' } });
+  async function load() {
+    const r = await api('/api/nginx/discover');
+    const rows = r.sites.filter((x) => !x.adopted);
+    if (!rows.length) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+    box.replaceChildren(h('h2', {}, `Existing nginx sites found on this server (${rows.length})`),
+      h('div', { class: 'muted', style: { marginBottom: '10px' } }, 'These files were not created by the panel. Adding one keeps the file exactly as it is (same name, same content): you get DNS and HTTPS checks, certificate status and a validated editor, and nothing is rewritten.'),
+      dataTable({
+        columns: [
+          { key: 'names', label: 'Domains', render: (x) => x.names.join(', ') },
+          { key: 'kind', label: 'Type', render: (x) => (x.laravelPath ? h('span', {}, h('span', { class: 'badge ok' }, 'PHP / Laravel'), ' ', h('span', { class: 'mono muted' }, x.laravelPath)) : x.kind === 'php' ? 'PHP' : x.kind === 'proxy' ? `proxy → ${x.target}` : x.kind === 'static' ? `static: ${x.root}` : x.kind) },
+          { key: 'https', label: 'HTTPS', render: (x) => h('span', { class: 'badge ' + (x.https ? 'ok' : '') }, x.https ? 'yes' : 'no') },
+          { key: 'file', label: 'File', render: (x) => h('code', {}, x.file) },
+        ], rows, empty: '',
+        rowActions: (x) => { const b = h('button', { class: 'sm primary' }, 'Add to panel'); b.onclick = act(b, async () => { const a = await api('/api/sites/adopt', { method: 'POST', body: { file: x.file } }); toast(`${a.site.domain} added; the file was not changed`); onAdopted(a.site); }); return b; },
+      }));
+  }
+  load().catch(() => box.classList.add('hidden'));
+  return box;
+}
+
 // ---------------------------------------------------------------- add / configure form
 function siteForm(site, apps) {
   const s = site || { aliases: [], upstream: { type: 'app' }, forceHttps: true, hsts: false, maxBodyMb: 10, customConfig: '' };
@@ -103,7 +127,7 @@ function siteForm(site, apps) {
     domain: h('input', { value: s.domain || '', placeholder: 'app.example.com', disabled: !!site }),
     aliases: h('input', { value: (s.aliases || []).join(', '), placeholder: 'www.example.com, other.example.com' }),
     type: h('select', {}, [['app', 'A deployed app'], ['url', 'A URL / port on this server'], ['static', 'Static files']].map(([v, l]) => h('option', { value: v, selected: v === u.type }, l))),
-    appId: h('select', {}, apps.length ? apps.map((a) => h('option', { value: a.id, selected: a.id === u.appId }, `${a.name} (port ${a.port})`)) : h('option', { value: '' }, 'No apps on this server')),
+    appId: h('select', {}, apps.length ? apps.map((a) => h('option', { value: a.id, selected: a.id === u.appId }, `${a.name} (${a.mode === 'service' ? `port ${a.port}` : a.mode === 'static' ? 'static website' : 'PHP'})`)) : h('option', { value: '' }, 'No apps on this server')),
     url: h('input', { value: u.url || 'http://127.0.0.1:3000' }),
     root: h('input', { value: u.root || '/var/www/site' }),
     spa: h('input', { type: 'checkbox', checked: !!u.spa }),
@@ -116,7 +140,7 @@ function siteForm(site, apps) {
   const target = h('div', {});
   const sync = () => {
     const t = f.type.value;
-    target.replaceChildren(t === 'app' ? field('App', f.appId, 'Traffic goes to the app’s port; the port follows the app if you change it.')
+    target.replaceChildren(t === 'app' ? field('App', f.appId, 'The panel sets up the right nginx configuration for the app type (reverse proxy, static files or PHP-FPM) and follows it if the app changes.')
       : t === 'url' ? field('Upstream URL', f.url, 'For example http://127.0.0.1:8080 (a service you run yourself)')
         : h('div', {}, field('Folder on the server', f.root, 'nginx must be able to read it'), h('label', { class: 'row' }, f.spa, 'Single-page app (serve index.html for unknown paths)')));
   };
@@ -175,7 +199,7 @@ function pageDomains() {
     });
   };
   return h('div', {}, pageHeader('Domains', `nginx sites, HTTPS certificates and DNS checks on ${(currentServer() || {}).name || 'this server'}`, admin ? h('button', { class: 'primary', onclick: add }, 'Add domain') : null),
-    nginxCard(() => load().catch(() => {})), box);
+    nginxCard(() => load().catch(() => {})), admin ? discoveryCard((site) => { location.hash = `#/domains/${site.id}`; }) : '', box);
 }
 
 // ---------------------------------------------------------------- detail page

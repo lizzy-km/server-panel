@@ -12,6 +12,8 @@ const ops = require('./lib/ops');
 const pkg = require('./lib/pkg');
 const { DeployManager } = require('./lib/deploy');
 const { DomainManager } = require('./lib/domains');
+const { LaravelManager } = require('./lib/laravel');
+const { summarizeFile } = require('./lib/nginxparse');
 const { readBody } = require('./lib/http');
 
 const COOKIE = 'panel_session';
@@ -19,7 +21,7 @@ const COOKIE = 'panel_session';
 function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
   const store = new JsonStore(path.join(config.dataDir, 'panel.json'), {
-    users: [], sessions: {}, servers: [], apps: [], sites: [], deploys: [], settings: { alerts: { cpu: 90, mem: 90, disk: 90 } },
+    users: [], sessions: {}, servers: [], apps: [], sites: [], deploys: [], laravel: [], settings: { alerts: { cpu: 90, mem: 90, disk: 90 } },
   });
   const audit = new AuditLog(path.join(config.dataDir, 'audit.log'));
   const auth = new Auth(store, { sessionHours: config.sessionHours });
@@ -27,6 +29,7 @@ function createApp(overrides = {}) {
   const servers = new ServerRegistry({ store, vault, config });
   const deploy = new DeployManager({ store, vault, servers, config });
   const domains = new DomainManager({ store, servers, deploy, config });
+  const laravel = new LaravelManager({ store, servers, config });
   // an app's port changed and a deploy has made the new port live: repoint nginx sites that proxy to it
   deploy.onPortChanged = async (app) => {
     for (const site of domains.sites.filter((x) => x.serverId === app.serverId && x.upstream.type === 'app' && x.upstream.appId === app.id)) {
@@ -312,6 +315,8 @@ function createApp(overrides = {}) {
     return deploy.runner.read(id, Number(q(ctx, 'offset', 0)) || 0);
   });
 
+  route('GET', '/api/presets', 'user', async () => ({ presets: require('./lib/presets').publicPresets() }));
+  scoped('POST', '/api/apps/detect', 'admin', async (ctx) => deploy.detect(ctx.srv.id, await readJson(ctx.req)));
   scoped('GET', '/api/apps', 'user', async (ctx) => ({ apps: deploy.list(ctx.srv.id, { admin: isAdmin(ctx) }), defaults: { baseDir: config.appsBaseDir } }));
   scoped('POST', '/api/apps', 'admin', async (ctx) => {
     const b = await readJson(ctx.req, 256 * 1024);
@@ -421,6 +426,13 @@ function createApp(overrides = {}) {
     note(ctx, 'nginx_file_delete', q(ctx, 'name'));
     return r;
   });
+  scoped('GET', '/api/nginx/discover', 'admin', async (ctx) => ({ sites: await domains.discover(ctx.srv.id) }));
+  scoped('POST', '/api/sites/adopt', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const site = await domains.adopt(ctx.srv.id, b.file, ctx.user.username);
+    note(ctx, 'site_adopt', `${site.domain} (${site.confFile})`);
+    return { site: domains.publicSite(site) };
+  });
   scoped('GET', '/api/sites', 'user', async (ctx) => ({ sites: domains.list(ctx.srv.id, isAdmin(ctx)) }));
   scoped('POST', '/api/sites', 'admin', async (ctx) => {
     const b = await readJson(ctx.req, 256 * 1024);
@@ -437,7 +449,7 @@ function createApp(overrides = {}) {
   });
   scoped('DELETE', '/api/sites', 'admin', async (ctx) => {
     const site = siteOf(ctx, q(ctx, 'id'));
-    await domains.remove(site.id, { removeCert: q(ctx, 'removeCert') === '1' });
+    await domains.remove(site.id, { removeCert: q(ctx, 'removeCert') === '1', keepFile: q(ctx, 'deleteFile') === '1' ? false : undefined });
     note(ctx, 'site_delete', site.domain);
     return { ok: true };
   });
@@ -472,6 +484,53 @@ function createApp(overrides = {}) {
   scoped('GET', '/api/sites/dns', 'user', async (ctx) => domains.dns(siteOf(ctx, q(ctx, 'id'))));
   scoped('GET', '/api/sites/http', 'user', async (ctx) => domains.http(siteOf(ctx, q(ctx, 'id'))));
   scoped('GET', '/api/sites/logs', 'admin', async (ctx) => domains.logs(siteOf(ctx, q(ctx, 'id')), q(ctx, 'kind', 'access'), q(ctx, 'lines', 200)));
+
+  // --- Laravel (PHP) apps: adopt existing installs, artisan, logs, .env ---
+  const lvOf = (ctx, id) => { const a = laravel.find(id); if (a.serverId !== ctx.srv.id) throw httpError(404, 'Unknown Laravel app on this server'); return a; };
+  const lvSites = (ctx, app) => domains.sites.filter((x) => x.serverId === ctx.srv.id && x.rawConfig && (summarizeFile(x.rawConfig).root || '').replace(/\/+$/, '') === `${app.path}/public`).map((x) => ({ id: x.id, domain: x.domain, https: !!x.tls }));
+  scoped('GET', '/api/laravel', 'user', async (ctx) => ({ apps: laravel.list(ctx.srv.id).map((a) => ({ ...a, sites: lvSites(ctx, a) })) }));
+  scoped('POST', '/api/laravel/inspect', 'admin', async (ctx) => ({ info: await laravel.inspect(ctx.srv.host, String((await readJson(ctx.req)).path || '')) }));
+  scoped('POST', '/api/laravel', 'admin', async (ctx) => {
+    const r = await laravel.adopt(ctx.srv.id, await readJson(ctx.req), ctx.user.username);
+    note(ctx, 'laravel_adopt', `${r.app.name} (${r.app.path})`);
+    return r;
+  });
+  scoped('GET', '/api/laravel/detail', 'user', async (ctx) => {
+    const app = lvOf(ctx, q(ctx, 'id'));
+    return { app, info: await laravel.detail(app, { fresh: q(ctx, 'fresh') === '1' }), sites: lvSites(ctx, app), artisan: Object.fromEntries(Object.entries(require('./lib/laravel').ARTISAN).map(([k, v]) => [k, v.label || k])) };
+  });
+  scoped('DELETE', '/api/laravel', 'admin', async (ctx) => {
+    const app = lvOf(ctx, q(ctx, 'id'));
+    laravel.remove(app.id);
+    note(ctx, 'laravel_forget', `${app.name} (server files untouched)`);
+    return { ok: true };
+  });
+  scoped('POST', '/api/laravel/artisan', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = lvOf(ctx, b.id);
+    note(ctx, 'artisan', `${app.name}: ${b.command}`);
+    return laravel.artisan(app, String(b.command || ''));
+  });
+  scoped('POST', '/api/laravel/fpm', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = lvOf(ctx, b.id);
+    note(ctx, 'phpfpm_' + b.action, app.fpmUnit);
+    return laravel.fpm(app, b.action);
+  });
+  scoped('GET', '/api/laravel/logfiles', 'admin', async (ctx) => ({ files: await laravel.logFiles(lvOf(ctx, q(ctx, 'id'))) }));
+  scoped('GET', '/api/laravel/logs', 'admin', async (ctx) => laravel.logs(lvOf(ctx, q(ctx, 'id')), q(ctx, 'file'), q(ctx, 'lines', 300), q(ctx, 'q')));
+  scoped('GET', '/api/laravel/env', 'admin', async (ctx) => {
+    const app = lvOf(ctx, q(ctx, 'id'));
+    note(ctx, 'env_view', `${app.name} .env (values revealed)`);
+    return laravel.readEnv(app);
+  });
+  scoped('PUT', '/api/laravel/env', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 512 * 1024);
+    const app = lvOf(ctx, b.id);
+    const r = await laravel.writeEnv(app, b.content, { apply: !!b.apply, force: !!b.force });
+    note(ctx, 'env_save', `${app.name} .env (${String(b.content).length} bytes${b.apply ? ', applied' : ''}${b.force ? ', APP_KEY override' : ''})`);
+    return r;
+  });
 
   // --- users & audit ---
   route('GET', '/api/users', 'admin', async () => ({ users: auth.users.map((u) => auth.publicUser(u)) }));
@@ -550,11 +609,12 @@ function createApp(overrides = {}) {
 
   const server = http.createServer((req, res) => { handle(req, res); });
   server.requestTimeout = 0; // allow long uploads; body size is limited separately
-  return { server, config, auth, store, audit, servers, vault, deploy, domains };
+  return { server, config, auth, store, audit, servers, vault, deploy, domains, laravel };
 }
 
 function main() {
   const app = createApp();
+  app.main = true;
   app.server.listen(app.config.port, app.config.host, () => {
     const { host, port } = app.config;
     console.log(`Server Panel listening on http://${host}:${port}`);
@@ -570,8 +630,9 @@ function main() {
   const shutdown = () => { app.servers.closeAll(); app.server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  return app;
 }
 
 if (require.main === module) main();
 
-module.exports = { createApp };
+module.exports = { createApp, main };
