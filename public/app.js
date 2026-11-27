@@ -220,6 +220,7 @@ const NAV = [
   { id: 'packages', label: 'Updates', icon: '⬆', page: () => pagePackages() },
   { id: 'deploy', label: 'Deploy', icon: '⇪', page: () => pageDeploy() },
   { id: 'domains', label: 'Domains', icon: '⌂', page: () => pageDomains() },
+  { id: 'databases', label: 'Databases', icon: '▥', admin: true, page: () => pageDatabases() },
   { id: 'docker', label: 'Docker', icon: '▣', page: () => pageDocker() },
   { id: 'network', label: 'Network', icon: '⇄', page: () => pageNetwork() },
   { sep: true, admin: true },
