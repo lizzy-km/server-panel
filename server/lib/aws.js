@@ -1,46 +1,37 @@
 'use strict';
-const http = require('http');
+/**
+ * EC2 instance metadata (IMDSv2), fetched ON the target with curl. Amazon Linux 2023 enforces IMDSv2.
+ * Resolves null when the target is not an EC2 instance or the metadata service is unreachable.
+ */
+const SCRIPT = [
+  "T=$(curl -s -m 2 -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token) || exit 3",
+  '[ -n "$T" ] || exit 3',
+  'for k in instance-id instance-type placement/availability-zone local-ipv4 public-ipv4 ami-id; do',
+  '  printf "%s=" "$k"; curl -s -m 2 -H "X-aws-ec2-metadata-token: $T" "http://169.254.169.254/latest/meta-data/$k"; echo',
+  'done',
+].join('\n');
 
-const HOST = '169.254.169.254';
+const SAFE = /^[\w.:\/-]{1,64}$/;
 
-function request(method, path, headers = {}, timeout = 1000) {
-  return new Promise((resolve, reject) => {
-    const req = http.request({ host: HOST, path, method, headers, timeout }, (res) => {
-      let body = '';
-      res.setEncoding('utf8');
-      res.on('data', (d) => { body += d; });
-      res.on('end', () => (res.statusCode === 200 ? resolve(body.trim()) : reject(new Error(`IMDS ${res.statusCode}`))));
-    });
-    req.on('timeout', () => req.destroy(new Error('IMDS timeout')));
-    req.on('error', reject);
-    req.end();
-  });
+function parseMetadata(text) {
+  const m = {};
+  for (const line of text.split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0) { const v = line.slice(i + 1).trim(); m[line.slice(0, i)] = SAFE.test(v) ? v : null; }
+  }
+  if (!m['instance-id'] || !/^i-[0-9a-f]+$/.test(m['instance-id'])) return null;
+  const az = m['placement/availability-zone'];
+  return {
+    instanceId: m['instance-id'], instanceType: m['instance-type'], availabilityZone: az,
+    region: az ? az.replace(/[a-z]$/, '') : null, localIp: m['local-ipv4'], publicIp: m['public-ipv4'], amiId: m['ami-id'],
+  };
 }
 
-/**
- * EC2 instance metadata via IMDSv2 (token-based; Amazon Linux 2023 enforces it by default).
- * Resolves null when not running on EC2 or when the metadata service is unreachable
- * (e.g. hop limit 1 inside a container).
- */
-async function fetchInstanceMetadata() {
+async function fetchInstanceMetadata(host) {
   try {
-    const token = await request('PUT', '/latest/api/token', { 'X-aws-ec2-metadata-token-ttl-seconds': '60' });
-    const get = (p) => request('GET', `/latest/meta-data/${p}`, { 'X-aws-ec2-metadata-token': token }).catch(() => null);
-    const [instanceId, instanceType, az, localIp, publicIp, amiId] = await Promise.all([
-      get('instance-id'), get('instance-type'), get('placement/availability-zone'), get('local-ipv4'), get('public-ipv4'), get('ami-id'),
-    ]);
-    if (!instanceId) return null;
-    return { instanceId, instanceType, availabilityZone: az, region: az ? az.replace(/[a-z]$/, '') : null, localIp, publicIp, amiId };
+    const r = await host.run('sh', ['-c', SCRIPT], { timeout: 12000 });
+    return r.ok ? parseMetadata(r.stdout) : null;
   } catch { return null; }
 }
 
-/** Looks up metadata once in the background and caches it (metadata is static for an instance's lifetime). */
-class InstanceMetadata {
-  constructor() { this.value = null; this.done = false; }
-  start() {
-    fetchInstanceMetadata().then((v) => { this.value = v; this.done = true; });
-    return this;
-  }
-}
-
-module.exports = { InstanceMetadata, fetchInstanceMetadata };
+module.exports = { fetchInstanceMetadata, parseMetadata };

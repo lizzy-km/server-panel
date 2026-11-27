@@ -42,7 +42,14 @@ const fmt = {
 
 const level = (p, warn = 75, bad = 90) => (p >= bad ? 'bad' : p >= warn ? 'warn' : '');
 
+const GLOBAL_API = /^\/api\/(session|setup|login|logout|account|users|audit|servers|alerts\/thresholds)/;
+function withServer(path) {
+  if (!state.server || GLOBAL_API.test(path)) return path;
+  return path + (path.includes('?') ? '&' : '?') + 'server=' + encodeURIComponent(state.server);
+}
+
 async function api(path, { method = 'GET', body, raw } = {}) {
+  path = withServer(path);
   const opts = { method, headers: { 'X-Panel-Request': '1' }, credentials: 'same-origin' };
   if (raw !== undefined) { opts.body = raw; }
   else if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
@@ -173,12 +180,34 @@ function lineChart({ series, max = 100, format = (v) => `${v.toFixed(0)}%`, heig
 }
 
 // ---------------------------------------------------------------- app state / router
-const state = { user: null, features: {}, setupRequired: false, page: null };
+const state = { user: null, features: {}, setupRequired: false, page: null, servers: [], server: null };
+
+async function loadServers() {
+  try { state.servers = (await api('/api/servers')).servers; } catch { state.servers = []; }
+  let want = null;
+  try { want = localStorage.getItem('panel-server'); } catch { /* ignore */ }
+  state.server = state.servers.find((x) => x.id === want) ? want : (state.servers[0] ? state.servers[0].id : null);
+}
+const currentServer = () => state.servers.find((x) => x.id === state.server) || null;
+function selectServer(id) {
+  state.server = id;
+  try { localStorage.setItem('panel-server', id); } catch { /* ignore */ }
+  render();
+}
 let cleanups = [];
 const onLeave = (fn) => cleanups.push(fn);
+function setBanner(msg) {
+  const b = document.getElementById('conn-banner');
+  if (!b) return;
+  b.textContent = msg ? '⚠ ' + msg : '';
+  b.classList.toggle('hidden', !msg);
+}
 function poll(fn, ms) {
   let stopped = false;
-  const tick = async () => { if (stopped) return; try { await fn(); } catch (e) { /* surface once, keep polling */ } };
+  const tick = async () => {
+    if (stopped) return;
+    try { await fn(); setBanner(''); } catch (e) { if (!stopped) setBanner(e.message); }
+  };
   const id = setInterval(() => { if (!document.hidden) tick(); }, ms);
   onLeave(() => { stopped = true; clearInterval(id); });
   return tick();
@@ -192,6 +221,7 @@ const NAV = [
   { id: 'docker', label: 'Docker', icon: '▣', page: () => pageDocker() },
   { id: 'network', label: 'Network', icon: '⇄', page: () => pageNetwork() },
   { sep: true, admin: true },
+  { id: 'servers', label: 'Servers', icon: '☁', admin: true, page: () => pageServers() },
   { id: 'files', label: 'Files', icon: '▤', admin: true, page: () => pageFiles() },
   { id: 'logs', label: 'Logs', icon: '≣', admin: true, page: () => pageLogs() },
   { id: 'cron', label: 'Cron jobs', icon: '◷', admin: true, page: () => pageCron() },
@@ -215,8 +245,11 @@ function render() {
   const id = currentRoute();
   const item = items.find((n) => n.id === id) || items[0];
   const content = h('div', {});
+  const picker = h('select', { class: 'server-select', 'aria-label': 'Server', onchange: (e) => selectServer(e.target.value) },
+    state.servers.length ? state.servers.map((x) => h('option', { value: x.id, selected: x.id === state.server }, `${x.name}${x.kind === 'local' ? '' : ` — ${x.host}`}`)) : h('option', { value: '' }, 'No servers yet'));
   const side = h('aside', { class: 'side', id: 'side' },
     h('div', { class: 'brand' }, h('span', { class: 'logo' }, h('i')), 'Server Panel'),
+    h('div', { class: 'server-pick' }, h('label', {}, 'Server'), picker),
     h('nav', { class: 'nav' }, items.map((n) => n.sep ? h('div', { class: 'sep' }) :
       h('a', { href: `#/${n.id}`, class: n.id === item.id ? 'active' : '', onclick: () => side.classList.remove('open') }, h('span', { class: 'ico' }, n.icon), n.label))),
     h('div', { class: 'spacer' }),
@@ -226,7 +259,20 @@ function render() {
       h('a', { href: '#', onclick: async (e) => { e.preventDefault(); try { await api('/api/logout', { method: 'POST' }); } catch { /* ignore */ } state.user = null; render(); } }, h('span', { class: 'ico' }, '⏏'), 'Sign out')));
   app.append(h('div', { class: 'shell' }, side, h('main', { class: 'main' },
     h('button', { class: 'menu-btn', 'aria-label': 'Menu', onclick: () => side.classList.toggle('open'), style: { marginBottom: '12px' } }, '☰ Menu'), content)));
-  try { content.append(item.page()); } catch (e) { content.append(h('div', { class: 'notice' }, `Failed to load: ${e.message}`)); }
+  content.append(h('div', { id: 'conn-banner', class: 'alert crit hidden', role: 'alert' }));
+  const needsServer = !['servers', 'users', 'audit'].includes(item.id);
+  try {
+    if (needsServer && !state.server) content.append(noServerState());
+    else content.append(item.page());
+  } catch (e) { content.append(h('div', { class: 'notice' }, `Failed to load: ${e.message}`)); }
+}
+
+function noServerState() {
+  const admin = state.user.role === 'admin';
+  return h('div', { class: 'card empty', style: { padding: '48px 24px' } },
+    h('h2', { style: { justifyContent: 'center', fontSize: '18px' } }, 'No servers connected yet'),
+    h('p', { class: 'muted' }, admin ? 'Add a server with its address and SSH key (.pem or .ppk) to start managing it.' : 'Ask an administrator to add a server.'),
+    admin ? h('button', { class: 'primary', onclick: () => { location.hash = '#/servers'; setTimeout(() => addServerDialog(), 50); } }, 'Add your first server') : null);
 }
 
 function toggleTheme() {
@@ -252,7 +298,7 @@ function authScreen(setup) {
       e.preventDefault(); err.textContent = ''; btn.disabled = true;
       try {
         const r = await api(setup ? '/api/setup' : '/api/login', { method: 'POST', body: { username: user.value, password: pass.value, setupToken: token && token.value } });
-        state.user = r.user; state.setupRequired = false; render();
+        state.user = r.user; state.setupRequired = false; await loadServers(); render();
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
     },
   },
@@ -541,7 +587,7 @@ function pageNetwork() {
     try {
       const [p, s] = await Promise.all([api('/api/network/ports'), api('/api/system')]);
       ifBox.replaceChildren(h('h2', {}, 'Interfaces'), dataTable({
-        columns: [{ key: 'name', label: 'Name' }, { key: 'address', label: 'Address' }, { key: 'family', label: 'Family' }, { key: 'mac', label: 'MAC' }],
+        columns: [{ key: 'name', label: 'Name' }, { key: 'address', label: 'Address' }, { key: 'family', label: 'Family' }],
         rows: s.info.interfaces.filter((i) => !i.internal), empty: 'No interfaces',
       }));
       if (!p.available) portsBox.replaceChildren(h('div', { class: 'notice' }, 'The `ss` command is not available on this host.'));
@@ -554,7 +600,8 @@ function pageNetwork() {
 // ---------------------------------------------------------------- files
 function pageFiles() {
   const root = h('div', {});
-  let cwd = sessionStorageGet('panel-cwd') || '/';
+  const cwdKey = 'panel-cwd-' + state.server;
+  let cwd = sessionStorageGet(cwdKey) || '/';
   const crumbs = h('div', { class: 'crumbs' });
   const listBox = h('div', { class: 'card' });
   const join = (a, b) => (a === '/' ? '' : a) + '/' + b;
@@ -563,7 +610,7 @@ function pageFiles() {
   async function go(path) {
     try {
       const r = await api('/api/files/list?path=' + encodeURIComponent(path));
-      cwd = r.path; sessionStoragePut('panel-cwd', cwd);
+      cwd = r.path; sessionStoragePut(cwdKey, cwd);
       drawCrumbs();
       listBox.replaceChildren(dataTable({
         columns: [
@@ -575,7 +622,7 @@ function pageFiles() {
         ],
         rows: r.entries, sort: { key: 'name', dir: 'asc', onSort() {} }, empty: 'This folder is empty',
         rowActions: (e) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-          e.type === 'file' ? h('a', { class: 'btn sm', style: { textDecoration: 'none', fontSize: '12px', padding: '3px 9px' }, href: '/api/files/download?path=' + encodeURIComponent(join(cwd, e.name)) }, 'Download') : null,
+          e.type === 'file' ? h('a', { class: 'btn sm', style: { textDecoration: 'none', fontSize: '12px', padding: '3px 9px' }, href: withServer('/api/files/download?path=' + encodeURIComponent(join(cwd, e.name))) }, 'Download') : null,
           h('button', { class: 'sm', onclick: () => rename(e) }, 'Rename'),
           h('button', { class: 'sm', onclick: () => chmod(e) }, 'chmod'),
           h('button', { class: 'sm danger', onclick: () => del(e) }, 'Delete')),
@@ -632,7 +679,7 @@ function pageFiles() {
   root.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.remove('hidden'); });
   root.addEventListener('dragleave', (e) => { if (e.target === drop) drop.classList.add('hidden'); });
   root.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.add('hidden'); upload([...e.dataTransfer.files]); });
-  root.append(pageHeader('Files', 'Browse and edit files inside the configured root'),
+  root.append(pageHeader('Files', `Browse and edit files on ${(currentServer() || {}).name || ''} (root: ${(currentServer() || {}).fileRoot || '/'})`),
     h('div', { class: 'toolbar' }, crumbs, h('span', { class: 'grow' }),
       h('button', { onclick: () => go(parent(cwd)) }, '↑ Up'), h('button', { onclick: () => go(cwd) }, 'Refresh'),
       h('button', { onclick: () => newItem('file') }, 'New file'), h('button', { onclick: () => newItem('dir') }, 'New folder'),
@@ -716,8 +763,183 @@ function pageTerminal() {
     else if (e.key === 'ArrowDown') { hi = Math.min(history.length, hi + 1); input.value = history[hi] || ''; e.preventDefault(); }
   });
   line('meta', 'Each command runs in a fresh bash process (no TTY). Every command is recorded in the audit log.');
-  return h('div', {}, pageHeader('Terminal', 'One-shot command runner', h('button', { onclick: () => out.replaceChildren() }, 'Clear')),
+  return h('div', {}, pageHeader('Terminal', `One-shot command runner on ${(currentServer() || {}).name || ''}`, h('button', { onclick: () => out.replaceChildren() }, 'Clear')),
     out, h('div', { class: 'row grow', style: { marginTop: '10px' } }, h('span', { class: 'mono muted' }, '$'), input, h('button', { class: 'primary', onclick: runIt }, 'Run')));
+}
+
+// ---------------------------------------------------------------- servers (SSH targets)
+function statusBadge(sv) {
+  const map = { connected: ['ok', 'connected'], idle: ['', 'idle'], error: ['bad', 'error'], local: ['ok', 'local'] };
+  const [cls, label] = map[sv.status] || ['', sv.status];
+  return h('span', { class: 'badge ' + cls, title: sv.lastError || '' }, label);
+}
+
+function readFileText(file) {
+  return new Promise((resolve, reject) => {
+    if (file.size > 64 * 1024) return reject(new Error('That file is too large to be a key (max 64 KB)'));
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = () => reject(new Error('Could not read the file'));
+    fr.readAsText(file);
+  });
+}
+
+/** Key picker: choose a .pem/.ppk file or paste its text. Exposes get(). */
+function keyField(initialHint) {
+  let text = '';
+  const status = h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, initialHint || 'Accepted: AWS .pem, OpenSSH private key, PuTTY .ppk (v2, or v3 without a passphrase).');
+  const area = h('textarea', { rows: 4, spellcheck: false, placeholder: '…or paste the private key here (-----BEGIN … PRIVATE KEY----- / PuTTY-User-Key-File-…)', oninput: () => { text = area.value; } });
+  area.style.fontSize = '11px';
+  const file = h('input', {
+    type: 'file', accept: '.pem,.ppk,.key,*/*',
+    onchange: async () => {
+      if (!file.files[0]) return;
+      try { text = await readFileText(file.files[0]); area.value = text; status.textContent = `Loaded ${file.files[0].name}`; } catch (e) { fail(e); }
+    },
+  });
+  const pass = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Only if the key is passphrase-protected' });
+  return {
+    el: h('div', {}, h('div', { class: 'field' }, h('label', {}, 'Private key file'), file, area, status),
+      h('div', { class: 'field' }, h('label', {}, 'Key passphrase (optional)'), pass)),
+    get: () => ({ privateKey: text, passphrase: pass.value || undefined }),
+  };
+}
+
+function hostKeyConfirm(fp, onChange) {
+  const ok = h('input', { type: 'checkbox', onchange: () => onChange(ok.checked) });
+  return h('div', { class: 'notice', style: { marginBottom: '12px' } },
+    h('div', { style: { marginBottom: '6px' } }, 'The server presented this host key. Confirm it is really your server before trusting it — a mismatch would mean someone is intercepting the connection:'),
+    h('div', { class: 'fp mono' }, fp),
+    h('div', { class: 'muted', style: { fontSize: '12px', margin: '8px 0' } }, 'On the server (via SSM or the EC2 console) run: ', h('code', {}, 'ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub'), ' — or compare with the “SSH HOST KEY FINGERPRINTS” in the instance’s system log.'),
+    h('label', { class: 'row' }, ok, 'I have verified this fingerprint'));
+}
+
+function addServerDialog() {
+  const f = {
+    name: h('input', { placeholder: 'e.g. production-web' }),
+    host: h('input', { placeholder: 'ec2-203-0-113-10.compute-1.amazonaws.com or 203.0.113.10' }),
+    port: h('input', { type: 'number', value: 22, min: 1, max: 65535 }),
+    username: h('input', { value: 'ec2-user', autocomplete: 'off' }),
+    fileRoot: h('input', { value: '/home/ec2-user' }),
+  };
+  let rootTouched = false;
+  f.fileRoot.addEventListener('input', () => { rootTouched = true; });
+  f.username.addEventListener('input', () => { if (!rootTouched) f.fileRoot.value = f.username.value === 'root' ? '/root' : `/home/${f.username.value}`; });
+  const key = keyField();
+  const field = (label, el, hint) => h('div', { class: 'field' }, h('label', {}, label), el, hint ? h('div', { class: 'muted', style: { fontSize: '12px' } }, hint) : null);
+  const body = h('div', {});
+  const err = h('div', { class: 'alert crit hidden', role: 'alert' });
+  let fingerprint = null; let confirmed = false;
+
+  const next = h('button', { class: 'primary' }, 'Next: verify host key');
+  const add = h('button', { class: 'primary', disabled: true }, 'Connect & add server');
+  const back = h('button', { class: 'hidden' }, 'Back');
+  const cancel = h('button', {}, 'Cancel');
+  const showErr = (m) => { err.textContent = m; err.classList.toggle('hidden', !m); };
+
+  const step1 = h('div', {},
+    h('div', { class: 'grid', style: { gridTemplateColumns: '2fr 1fr', gap: '12px' } }, field('Server name', f.name), field('SSH port', f.port)),
+    field('Address', f.host, 'Public DNS name or IP. The panel must be able to reach this on the SSH port (check the security group).'),
+    field('Username', f.username, 'Amazon Linux: ec2-user'),
+    key.el,
+    field('File manager root', f.fileRoot, 'The Files page is confined to this folder on the server.'));
+  const step2 = h('div', { class: 'hidden' });
+  body.append(step1, step2);
+
+  const close = modal('Add server', h('div', {}, err, body, h('div', { class: 'actions' }, cancel, back, next, add)), { wide: false });
+  cancel.onclick = close;
+
+  next.onclick = act(next, async () => {
+    showErr('');
+    if (!f.name.value.trim() || !f.host.value.trim() || !key.get().privateKey.trim()) return showErr('Name, address and a private key are required.');
+    const r = await api('/api/servers/probe', { method: 'POST', body: { host: f.host.value.trim(), port: Number(f.port.value) } }).catch((e) => { showErr(e.message); return null; });
+    if (!r) return;
+    fingerprint = r.fingerprint;
+    step2.replaceChildren(hostKeyConfirm(fingerprint, (v) => { confirmed = v; add.disabled = !v; }));
+    step1.classList.add('hidden'); step2.classList.remove('hidden');
+    next.classList.add('hidden'); add.classList.remove('hidden'); back.classList.remove('hidden');
+  });
+  back.onclick = () => { step1.classList.remove('hidden'); step2.classList.add('hidden'); next.classList.remove('hidden'); add.classList.add('hidden'); back.classList.add('hidden'); showErr(''); };
+  add.classList.add('hidden');
+  add.onclick = act(add, async () => {
+    showErr('');
+    if (!confirmed) return;
+    try {
+      const r = await api('/api/servers', { method: 'POST', body: {
+        name: f.name.value.trim(), host: f.host.value.trim(), port: Number(f.port.value), username: f.username.value.trim(),
+        fileRoot: f.fileRoot.value.trim(), hostKey: fingerprint, ...key.get(),
+      } });
+      close();
+      await loadServers();
+      state.server = r.server.id; try { localStorage.setItem('panel-server', r.server.id); } catch { /* ignore */ }
+      toast(`Connected to ${r.server.name} (${r.info.os || 'Linux'}) as ${r.info.user}`);
+      if (!r.info.sudo) toast('Note: passwordless sudo is not available for this user — service control and updates may be refused.', true);
+      location.hash = '#/dashboard'; render();
+    } catch (e) { showErr(e.message); }
+  });
+}
+
+function editServerDialog(sv) {
+  const f = {
+    name: h('input', { value: sv.name }), host: h('input', { value: sv.host }), port: h('input', { type: 'number', value: sv.port }),
+    username: h('input', { value: sv.username }), fileRoot: h('input', { value: sv.fileRoot }),
+    useSudo: h('input', { type: 'checkbox', checked: sv.useSudo }),
+  };
+  const key = keyField('Leave empty to keep the current key.');
+  const err = h('div', { class: 'alert crit hidden', role: 'alert' });
+  let newFp = null; let newFpOk = false;
+  const fpBox = h('div', {});
+  const reverify = h('button', { class: 'sm' }, 'Re-verify host key');
+  reverify.onclick = act(reverify, async () => {
+    const r = await api('/api/servers/probe', { method: 'POST', body: { host: f.host.value.trim(), port: Number(f.port.value) } });
+    newFp = r.fingerprint; newFpOk = false;
+    fpBox.replaceChildren(r.fingerprint === sv.hostKey ? h('div', { class: 'muted' }, 'The server still presents the pinned key — nothing to change.') : hostKeyConfirm(r.fingerprint, (v) => { newFpOk = v; }));
+  });
+  const field = (label, el) => h('div', { class: 'field' }, h('label', {}, label), el);
+  const save = h('button', { class: 'primary' }, 'Save & verify');
+  const close = modal(`Edit ${sv.name}`, h('div', {}, err,
+    field('Name', f.name),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '2fr 1fr', gap: '12px' } }, field('Address', f.host), field('Port', f.port)),
+    field('Username', f.username), field('File manager root', f.fileRoot),
+    h('label', { class: 'row', style: { marginBottom: '12px' } }, f.useSudo, 'Use passwordless sudo for privileged actions (services, updates, journal)'),
+    h('div', { class: 'field' }, h('label', {}, 'Pinned host key'), h('div', { class: 'fp mono' }, sv.hostKey), reverify, fpBox),
+    h('h2', { style: { margin: '14px 0 8px' } }, 'Replace SSH key'), key.el,
+    h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Cancel'), save)));
+  save.onclick = act(save, async () => {
+    err.classList.add('hidden');
+    const body = { id: sv.id, name: f.name.value.trim(), host: f.host.value.trim(), port: Number(f.port.value), username: f.username.value.trim(), fileRoot: f.fileRoot.value.trim(), useSudo: f.useSudo.checked };
+    if (newFp && newFp !== sv.hostKey) { if (!newFpOk) { err.textContent = 'Confirm the new host key fingerprint first.'; err.classList.remove('hidden'); return; } body.hostKey = newFp; }
+    const k = key.get(); if (k.privateKey.trim()) Object.assign(body, k);
+    try { await api('/api/servers', { method: 'PUT', body }); close(); toast('Server updated'); await loadServers(); render(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+  });
+}
+
+function pageServers() {
+  const box = h('div', { class: 'card' });
+  async function load() {
+    await loadServers();
+    const rows = state.servers.filter((x) => x.kind === 'ssh');
+    box.replaceChildren(rows.length ? dataTable({
+      columns: [
+        { key: 'name', label: 'Name' },
+        { key: 'host', label: 'Connection', render: (x) => `${x.username}@${x.host}:${x.port}` },
+        { key: 'status', label: 'Status', render: statusBadge },
+        { key: 'keyType', label: 'SSH key', render: (x) => h('span', { title: x.keyComment || '' }, `${x.keyType} · ${x.keyFingerprint.slice(0, 22)}…`) },
+        { key: 'hostKey', label: 'Host key', render: (x) => h('span', { class: 'mono', title: x.hostKey }, x.hostKey.slice(0, 22) + '…') },
+        { key: 'useSudo', label: 'sudo', render: (x) => (x.useSudo ? 'yes' : 'no') },
+      ],
+      rows, empty: '',
+      rowActions: (x) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
+        h('button', { class: 'sm primary', onclick: () => { selectServer(x.id); location.hash = '#/dashboard'; } }, 'Open'),
+        (() => { const b = h('button', { class: 'sm' }, 'Test'); b.onclick = act(b, async () => { const r = await api('/api/servers/test', { method: 'POST', body: { id: x.id } }); toast(`${x.name}: OK in ${r.latencyMs} ms — ${r.os || 'Linux'}, user ${r.user}, sudo ${r.sudo ? 'available' : 'NOT available'}`, !r.sudo); load().then(render); }); return b; })(),
+        h('button', { class: 'sm', onclick: () => editServerDialog(x) }, 'Edit'),
+        h('button', { class: 'sm danger', onclick: async () => { if (await confirmDialog('Remove server?', `${x.name} will be removed from the panel and its stored SSH key deleted. The server itself is not touched.`, 'Remove')) try { await api('/api/servers?id=' + encodeURIComponent(x.id), { method: 'DELETE' }); await loadServers(); render(); } catch (e) { fail(e); } } }, 'Remove')),
+    }) : h('div', { class: 'empty' }, 'No servers yet. Add one to get started.'));
+  }
+  load().catch(fail);
+  const vaultNote = state.features.vault === 'env' ? 'SSH keys are encrypted with PANEL_SECRET.' : 'SSH keys are encrypted with a key stored in the panel’s data directory. Set PANEL_SECRET to keep that key off disk.';
+  return h('div', {}, pageHeader('Servers', 'Machines this panel manages over SSH', h('button', { class: 'primary', onclick: addServerDialog }, 'Add server')),
+    h('div', { class: 'notice', style: { marginBottom: '12px' } }, vaultNote, ' Private keys are never shown again after upload.'), box);
 }
 
 // ---------------------------------------------------------------- users
@@ -751,7 +973,7 @@ function pageAudit() {
   let rows = [];
   function draw() {
     box.replaceChildren(dataTable({
-      columns: [{ key: 'ts', label: 'Time', render: (r) => fmt.date(Date.parse(r.ts)) }, { key: 'user', label: 'User' }, { key: 'action', label: 'Action', render: (r) => h('span', { class: 'badge ' + (r.action === 'login_failed' ? 'bad' : '') }, r.action) }, { key: 'detail', label: 'Detail', wrap: true }, { key: 'ip', label: 'IP' }],
+      columns: [{ key: 'ts', label: 'Time', render: (r) => fmt.date(Date.parse(r.ts)) }, { key: 'user', label: 'User' }, { key: 'server', label: 'Server' }, { key: 'action', label: 'Action', render: (r) => h('span', { class: 'badge ' + (r.action === 'login_failed' ? 'bad' : '') }, r.action) }, { key: 'detail', label: 'Detail', wrap: true }, { key: 'ip', label: 'IP' }],
       rows, filterText: search.value, empty: 'No audit entries yet',
     }));
   }
@@ -766,6 +988,7 @@ function pageAudit() {
   try {
     const s = await api('/api/session');
     state.user = s.user; state.setupRequired = s.setupRequired; state.features = s.features;
+    if (s.user) await loadServers();
   } catch (e) { toast(e.message, true); }
   window.addEventListener('hashchange', render);
   render();

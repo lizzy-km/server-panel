@@ -135,3 +135,11 @@ pre.out, .terminal-out { background: var(--code); color: var(--code-text); paddi
   .menu-btn { display: inline-block; }
   .main { padding: 16px 14px 60px; }
 }
+
+/* servers */
+.server-pick { padding: 0 6px 12px; }
+.server-pick label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 4px 4px; font-weight: 600; }
+.server-select { width: 100%; }
+.fp { background: var(--panel2); padding: 6px 10px; border-radius: 8px; word-break: break-all; user-select: all; }
+.modal input[type="file"] { padding: 4px; }
+.modal select, .modal input:not([type="checkbox"]):not([type="file"]) { width: 100%; }

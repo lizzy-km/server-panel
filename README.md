@@ -1,114 +1,137 @@
 # Server Panel
 
-A self-hosted server control panel for **Amazon Linux 2023** (EC2), with **zero npm dependencies** (Node ≥ 20, vanilla JS frontend, no build step).
-It also runs on other systemd-based Linux distributions; the dnf/EC2 pieces simply show a notice elsewhere.
+A self-hosted control panel that manages **Amazon Linux 2023** (EC2) servers **over SSH**. You give it a server address and
+the SSH key (`.pem` or PuTTY `.ppk`); it connects and gives you monitoring, services, updates, Docker, files, logs, cron
+and a terminal for that machine. Add as many servers as you like and switch between them.
 
-| Area | What you get |
+Node ≥ 20, one runtime dependency (`ssh2`, pure JavaScript, 5 small packages), vanilla-JS frontend, no build step.
+
+| Area | What you get (per server) |
 |---|---|
-| **Dashboard** | Live CPU (total + per-core), memory/swap, network throughput charts, disk usage, system info, threshold alerts |
-| **Processes** | Sortable/filterable process list; send SIGTERM/SIGKILL (admin) |
-| **Updates** | `dnf` updates with security advisories (ALAS), reboot-required notice, update one package / security-only / all |
-| **EC2** | Instance ID, type, zone, public IP and AMI on the dashboard (IMDSv2) |
+| **Dashboard** | Live CPU (total + per-core), memory/swap, network throughput, disks, system info, EC2 instance details (IMDSv2), threshold alerts |
+| **Processes** | Sortable/filterable list; send SIGTERM/SIGKILL (admin) |
 | **Services** | systemd units: state, enable/disable, start/stop/restart, `systemctl status` |
+| **Updates** | `dnf` updates with security advisories (ALAS), reboot-required notice; update one package / security-only / all |
 | **Docker** | Containers (state, CPU, memory, ports) and images; start/stop/restart/remove, logs |
 | **Network** | Interfaces and listening sockets with owning process |
-| **Files** | Browse, edit (Ctrl+S), upload (drag & drop), download, rename, chmod, delete — confined to a root directory |
-| **Logs** | journald (by unit/priority) and log files, with text filter and follow mode |
-| **Cron** | View/edit the panel user's crontab with validation |
+| **Files** | Browse, edit (Ctrl+S), upload (drag & drop), download, rename, chmod, delete over SFTP, confined to a root folder |
+| **Logs** | journald (by unit/priority) and `/var/log` files, text filter, follow mode |
+| **Cron** | View/edit the SSH user's crontab with validation |
 | **Terminal** | One-shot command runner with history, timeouts, output caps |
-| **Users** | `admin` (full control) and `viewer` (read-only monitoring) roles |
-| **Audit log** | Every login, failed login and state-changing action |
+| **Servers** | Add/test/edit/remove servers, host-key pinning, key replacement |
+| **Users / Audit** | `admin` (full control) and `viewer` (read-only monitoring) roles; every login and action is logged with the server it touched |
 
-Features that need a missing tool (systemd, Docker, `ss`, `crontab`) degrade to an explanatory notice instead of failing.
+## Quick start
 
-## Install on Amazon Linux 2023
+```bash
+npm install --omit=optional
+node server/index.js          # prints a one-time setup token
+```
+
+Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
+
+```bash
+npm test    # 42 tests, including end-to-end SSH/SFTP against a real sshd (skipped if sshd isn't installed)
+```
+
+## Adding a server
+
+You need: the server's **address** (public DNS / IP), the **username** (`ec2-user` on Amazon Linux), and the **private key** file.
+
+1. **Servers → Add server**, fill in name / address / port / username, choose the key file (or paste it), add the passphrase if it has one.
+2. The panel connects *without logging in* and shows the server's **host key fingerprint**. Verify it matches your server
+   (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` via SSM / the EC2 console, or the "SSH HOST KEY FINGERPRINTS" block in the
+   instance's system log), tick the box, and continue. The fingerprint is **pinned**: if it ever changes (instance rebuilt, or
+   someone intercepting the connection) the panel refuses to connect until an admin re-verifies it.
+3. The panel logs in, checks the user and whether passwordless sudo works, and only then saves the server.
+
+**Supported key formats**
+
+| Format | Support |
+|---|---|
+| AWS `.pem` (RSA), OpenSSH private keys (RSA / ECDSA / Ed25519), with or without passphrase | ✅ |
+| PuTTY `.ppk` v2 (RSA / ECDSA / Ed25519), with or without passphrase | ✅ |
+| PuTTY `.ppk` v3 **without** a passphrase | ✅ |
+| PuTTY `.ppk` v3 **with** a passphrase | ❌ (needs Argon2, unavailable in Node 22). In PuTTYgen use *Conversions → Export OpenSSH key*, or save as v2, or remove the passphrase |
+| Public keys (`.pub`) | ❌ rejected with a clear message |
+
+**What the target server needs** (all true by default on Amazon Linux 2023): `sshd` reachable from the panel on the SSH port
+(security group inbound rule for port 22 from the panel's IP or security group); for service control, journal access and
+`dnf upgrade` the SSH user needs passwordless `sudo` (`ec2-user` has it). Without sudo the panel still works read-only where possible
+(monitoring, process list, service list, files you own). Optional: `cronie` (Cron page), Docker, `dnf-utils` (reboot notice).
+Servers reachable only through SSM Session Manager (no SSH port at all) are **not** supported.
+
+## Install the panel on Amazon Linux 2023
 
 ```bash
 sudo dnf install -y git
 git clone https://github.com/lizzy-km/server-panel && cd server-panel
-sudo ./deploy/install-al2023.sh --with-cron      # add --with-docker if you use Docker
+sudo ./deploy/install-al2023.sh
 ```
 
-The installer installs Node.js (`nodejs22`, falling back to `nodejs20`), creates an unprivileged `panel` user, copies the app to
-`/opt/server-panel`, keeps data in `/var/lib/server-panel`, writes `/etc/server-panel.env`, installs a systemd unit
-and prints the first-run setup token. Re-run it to upgrade; users and the audit log are preserved.
+The installer installs Node.js + npm, creates an unprivileged `panel` user, installs the app to `/opt/server-panel`, stores data in
+`/var/lib/server-panel`, generates a `PANEL_SECRET` in `/etc/server-panel.env`, installs a systemd unit and prints the setup token.
+Re-run it to upgrade; users, servers and the audit log are preserved. Put the panel in the same VPC as the servers it manages and use
+their private IPs where you can.
 
-The panel listens on `127.0.0.1:8080` only. **Do not open the port in your security group.** Use a tunnel:
+The panel listens on `127.0.0.1:8080` only — reach it with a tunnel (`ssh -L 8080:127.0.0.1:8080 ec2-user@<panel-ip>`, or an SSM
+port-forward), or put it behind an ALB / nginx / Caddy with TLS and set `PANEL_SECURE_COOKIES=true`.
 
-```bash
-# SSH
-ssh -L 8080:127.0.0.1:8080 ec2-user@<instance-ip>
-# or SSM Session Manager (no inbound ports at all)
-aws ssm start-session --target <instance-id> --document-name AWS-StartPortForwardingSession \
-  --parameters '{"portNumber":["8080"],"localPortNumber":["8080"]}'
-```
-
-Then open <http://localhost:8080>. To serve it publicly, put it behind an ALB or nginx/Caddy with TLS and set `PANEL_SECURE_COOKIES=true`.
-
-### AL2023 specifics
-
-- **Privileges:** the panel runs as `panel`, not root. The installer adds a sudoers drop-in so it can `systemctl start|stop|restart|reload|enable|disable`, read the journal and run `dnf -y upgrade`. Treat panel *admins* as having those root powers (and, through `dnf upgrade`/`systemctl`, effectively root-equivalent). Skip it with `--no-sudo` for a read-only panel; set `PANEL_USE_SUDO=false` to never try sudo.
-- **Do not add `NoNewPrivileges=true`** to the unit — it disables sudo.
-- **Cron:** AL2023 does not ship `cronie`; use `--with-cron` or `sudo dnf install -y cronie && sudo systemctl enable --now crond`. The Cron page shows this hint when `crontab` is missing.
-- **Logs:** AL2023 logs to the systemd journal (no `/var/log/messages`); the Logs page defaults to it. `dnf.log` and `cloud-init*.log` are under `/var/log`; `/var/log/audit` is root-only.
-- **Docker:** `--with-docker` installs Docker and adds `panel` to the `docker` group (equivalent to root on the host — only enable it if you need it).
-- **EC2 metadata:** read via IMDSv2. If the panel is containerised, raise the instance's metadata hop limit to 2 or the EC2 rows are simply omitted.
-- **Updates page:** `needs-restarting -r` (package `dnf-utils`) powers the reboot notice; without it the notice is skipped.
-
-## Quick start (any host, for development)
-
-```bash
-node server/index.js
-```
-
-On first run the console prints a **setup token**. Open `http://127.0.0.1:8080`, enter the token and create the admin account.
-
-```bash
-npm test   # 19 tests: API, auth, permissions, path-escape and injection checks
-```
+`--manage-local` additionally lets the panel manage **the machine it runs on** (sets `PANEL_ENABLE_LOCAL=true` and installs narrow
+sudoers rules for `systemctl`, `journalctl` and `dnf`); `--with-cron` / `--with-docker` set those up there. It is off by default because the
+panel is meant to manage remote servers.
 
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PANEL_HOST` | `127.0.0.1` | Bind address |
-| `PANEL_PORT` | `8080` | Port |
-| `PANEL_DATA_DIR` | `./data` | Users, sessions, audit log (mode 0600) |
-| `PANEL_FILES_ROOT` | `$HOME` | File manager root — nothing outside it is reachable, symlinks included |
-| `PANEL_LOG_DIRS` | `/var/log` | Comma-separated directories the log viewer may read |
-| `PANEL_USE_SUDO` | `true` | Use `sudo -n` for systemctl/journalctl/dnf when not root (falls back to direct execution) |
+| `PANEL_HOST` / `PANEL_PORT` | `127.0.0.1` / `8080` | Bind address / port |
+| `PANEL_DATA_DIR` | `./data` | Users, servers, encrypted keys, audit log (mode 0600) |
+| `PANEL_SECRET` | *(unset)* | Encrypts stored SSH keys. If unset, a random key is kept in `<data>/master.key` |
+| `PANEL_ENABLE_LOCAL` | `false` | Also manage the machine the panel runs on |
+| `PANEL_FILES_ROOT` | `$HOME` | File-manager root for the local host (remote servers have their own root) |
+| `PANEL_LOG_DIRS` | `/var/log` | Directories the log viewer may read (on the target) |
 | `PANEL_ENABLE_EXEC` | `true` | Set `false` to disable the Terminal page entirely |
+| `PANEL_USE_SUDO` | `true` | Local host only: use `sudo -n` when not root |
 | `PANEL_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
 | `PANEL_SESSION_HOURS` | `12` | Session lifetime |
 | `PANEL_MAX_UPLOAD_MB` | `200` | Upload limit |
-| `PANEL_SAMPLE_MS` / `PANEL_HISTORY` | `3000` / `200` | Metrics interval / points kept |
+| `PANEL_SAMPLE_MS` / `PANEL_HISTORY` | `3000` / `200` | Metrics interval / points kept (sampling only runs while someone is viewing a server) |
 
 ## Security model — read this before exposing it
 
-This tool can restart services, delete files and run commands as the user it runs under. Treat it like SSH.
+This tool holds SSH keys to your servers and can restart services, delete files and run commands on them. Protect it like a bastion host.
 
-- **Binds to localhost by default.** To reach it remotely, put it behind a TLS reverse proxy (nginx/Caddy) or an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 host`) and set `PANEL_SECURE_COOKIES=true`.
-- **Run it as an unprivileged user** and grant only what you need (e.g. a sudoers rule for `systemctl`); the panel never escalates privileges itself.
-- Passwords are scrypt-hashed (min 10 chars); sessions are random 256-bit tokens stored hashed, `HttpOnly` + `SameSite=Strict`; changing/resetting a password revokes sessions.
-- State-changing requests require a custom header and a same-origin `Origin` (CSRF). A strict CSP forbids inline scripts/styles, and the UI never uses `innerHTML`.
-- Login is throttled per IP (lockout from the 5th failure). First-run setup needs the console token, so a stranger cannot claim a fresh install.
-- Anything that shells out uses `execFile` with validated arguments (unit names, container IDs, signals); only the Terminal page runs arbitrary shell, admin-only and audited.
-- Viewers cannot access Files, Logs, Cron, Terminal, Users or Audit.
+- **SSH keys are encrypted at rest** (AES-256-GCM) and are **never returned by the API** or shown again after upload. With `PANEL_SECRET`
+  (set by the installer, stored in `/etc/server-panel.env`, outside the data dir) a copy of the data directory alone is useless; with only
+  `master.key` it protects against leaking `panel.json` by itself, not against someone who can read the whole data directory. **Back up
+  `PANEL_SECRET`** — without it stored keys cannot be decrypted (you would re-add the servers).
+- **Host keys are pinned** by SHA-256 fingerprint after you verify them; mismatches are refused (no silent trust-on-first-use after setup).
+- **Use dedicated, least-privilege keys.** Anyone who is a panel *admin* can run commands on every managed server as that SSH user; a
+  compromise of the panel host equals a compromise of those keys. Prefer a dedicated key pair per panel, restrict port 22 on the targets
+  to the panel's IP/security group, and rotate via *Edit → Replace SSH key*.
+- Admins can make the panel connect to any host:port it can reach (that is the feature); don't give the admin role to people you wouldn't give SSH to.
+- **Binds to localhost by default**; remote access needs a tunnel or a TLS reverse proxy.
+- Passwords are scrypt-hashed (min 10 chars); sessions are random 256-bit tokens stored hashed, `HttpOnly` + `SameSite=Strict`; password changes revoke sessions.
+- State-changing requests require a custom header and a same-origin `Origin` (CSRF). Strict CSP, and the UI never uses `innerHTML`.
+- Login is throttled per IP; first-run setup needs the console token.
+- Every value sent to a server is shell-quoted or validated (unit names, container IDs, package names, signals, paths); the file manager and log viewer are confined
+  (traversal and symlink escapes blocked, verified by tests against a real SFTP server). Only the Terminal page runs arbitrary shell: admin-only and audited.
+- Viewers can monitor every server but cannot reach Files, Logs, Cron, Terminal, Servers, Users or Audit, and cannot change anything.
 
 ## Layout
 
 ```
-server/index.js        HTTP server, routing, auth/CSRF pipeline
-server/lib/auth.js     users, scrypt, sessions, throttling
-server/lib/sys.js      metrics sampler, disks, processes, sockets
-server/lib/ops.js      services, docker, files, logs, cron, command runner
-server/lib/pkg.js      dnf updates / upgrades
-server/lib/aws.js      EC2 instance metadata (IMDSv2)
-deploy/                AL2023 installer + systemd unit
-public/                single-page UI (app.js, style.css, index.html)
-test/panel.test.js     integration + unit tests (node:test)
+server/index.js         HTTP server, routing, auth/CSRF pipeline, server-scoped routes (?server=<id>)
+server/lib/host.js      LocalHost + SshHost (ssh2 exec/SFTP, host-key pinning, sudo fallback)
+server/lib/keys.js      .pem / OpenSSH / .ppk loading and PPK v2/v3 conversion
+server/lib/vault.js     AES-256-GCM encryption of stored secrets
+server/lib/servers.js   server registry: add/verify/update/remove, live connections
+server/lib/sys.js       metrics sampler, disks, processes, sockets (via a host)
+server/lib/ops.js       services, docker, files, logs, cron (via a host)
+server/lib/pkg.js       dnf updates / upgrades      server/lib/aws.js  EC2 instance metadata
+server/lib/auth.js      users, scrypt, sessions, throttling
+public/                 single-page UI
+deploy/                 AL2023 installer + systemd unit
+test/                   unit + end-to-end tests (node:test)
 ```
-
-## Running as a service
-
-`deploy/server-panel.service` is the unit the installer uses. `PANEL_USE_SUDO` (default `true` when not root) controls the sudo escalation described above.

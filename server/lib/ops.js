@@ -1,8 +1,7 @@
 'use strict';
-const fs = require('fs');
-const fsp = require('fs/promises');
+/** Operations on a target machine (services, Docker, files, logs, cron). Every function takes a Host. */
 const path = require('path');
-const { run, runPriv } = require('./exec');
+const { Transform } = require('stream');
 const { httpError } = require('./auth');
 
 // ======================= systemd services =======================
@@ -17,10 +16,10 @@ function parseUnits(text) {
   }).filter(Boolean);
 }
 
-async function listServices() {
-  const r = await run('systemctl', ['list-units', '--type=service', '--all', '--no-pager', '--plain', '--no-legend']);
+async function listServices(host) {
+  const r = await host.run('systemctl', ['list-units', '--type=service', '--all', '--no-pager', '--plain', '--no-legend']);
   if (r.missing || (!r.stdout && !r.ok)) return { available: false, error: r.stderr.trim() || 'systemd not available', list: [] };
-  const enabled = await run('systemctl', ['list-unit-files', '--type=service', '--no-pager', '--plain', '--no-legend']);
+  const enabled = await host.run('systemctl', ['list-unit-files', '--type=service', '--no-pager', '--plain', '--no-legend']);
   const map = {};
   for (const line of enabled.stdout.trim().split('\n')) {
     const [u, st] = line.trim().split(/\s+/);
@@ -29,17 +28,17 @@ async function listServices() {
   return { available: true, list: parseUnits(r.stdout).map((u) => ({ ...u, enabled: map[u.unit] || 'unknown' })) };
 }
 
-async function serviceAction(unit, action) {
+async function serviceAction(host, unit, action) {
   if (!UNIT_RE.test(unit)) throw httpError(400, 'Invalid unit name');
   if (!SERVICE_ACTIONS.includes(action)) throw httpError(400, 'Invalid action');
-  const r = await runPriv('systemctl', [action, unit], { timeout: 60000 });
+  const r = await host.runPriv('systemctl', [action, unit], { timeout: 60000 });
   if (!r.ok) throw httpError(500, (r.stderr || r.stdout || 'systemctl failed').trim());
   return { ok: true };
 }
 
-async function serviceStatus(unit) {
+async function serviceStatus(host, unit) {
   if (!UNIT_RE.test(unit)) throw httpError(400, 'Invalid unit name');
-  const r = await run('systemctl', ['status', unit, '--no-pager', '-n', '30']);
+  const r = await host.run('systemctl', ['status', unit, '--no-pager', '-n', '30']);
   return { output: r.stdout || r.stderr };
 }
 
@@ -50,13 +49,13 @@ const DOCKER_ACTIONS = ['start', 'stop', 'restart', 'pause', 'unpause', 'kill', 
 
 const jsonLines = (text) => text.trim().split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
 
-async function dockerOverview() {
-  const ps = await run('docker', ['ps', '-a', '--format', '{{json .}}'], { timeout: 15000 });
-  if (ps.missing) return { available: false, error: 'Docker CLI not installed', containers: [], images: [] };
+async function dockerOverview(host) {
+  const ps = await host.runPriv('docker', ['ps', '-a', '--format', '{{json .}}'], { timeout: 20000 });
+  if (ps.missing || /command not found|not found/i.test(ps.stderr)) return { available: false, error: 'Docker is not installed on this server', containers: [], images: [] };
   if (!ps.ok) return { available: false, error: ps.stderr.trim() || 'Docker daemon not reachable', containers: [], images: [] };
   const [stats, images] = await Promise.all([
-    run('docker', ['stats', '--no-stream', '--format', '{{json .}}'], { timeout: 15000 }),
-    run('docker', ['images', '--format', '{{json .}}'], { timeout: 15000 }),
+    host.runPriv('docker', ['stats', '--no-stream', '--format', '{{json .}}'], { timeout: 20000 }),
+    host.runPriv('docker', ['images', '--format', '{{json .}}'], { timeout: 20000 }),
   ]);
   const statMap = {};
   for (const s of jsonLines(stats.stdout)) statMap[s.ID || s.Container] = s;
@@ -64,37 +63,35 @@ async function dockerOverview() {
     available: true,
     containers: jsonLines(ps.stdout).map((c) => {
       const s = statMap[c.ID] || {};
-      return {
-        id: c.ID, name: c.Names, image: c.Image, state: c.State, status: c.Status, ports: c.Ports, created: c.RunningFor,
-        cpu: s.CPUPerc || '', mem: s.MemUsage || '',
-      };
+      return { id: c.ID, name: c.Names, image: c.Image, state: c.State, status: c.Status, ports: c.Ports, created: c.RunningFor, cpu: s.CPUPerc || '', mem: s.MemUsage || '' };
     }),
     images: jsonLines(images.stdout).map((i) => ({ id: i.ID, repo: i.Repository, tag: i.Tag, size: i.Size, created: i.CreatedSince })),
   };
 }
 
-async function dockerAction(id, action) {
+async function dockerAction(host, id, action) {
   if (!DOCKER_ID_RE.test(id)) throw httpError(400, 'Invalid container id');
   if (!DOCKER_ACTIONS.includes(action)) throw httpError(400, 'Invalid action');
-  const args = action === 'rm' ? ['rm', id] : [action, id];
-  const r = await run('docker', args, { timeout: 60000 });
+  const r = await host.runPriv('docker', action === 'rm' ? ['rm', id] : [action, id], { timeout: 60000 });
   if (!r.ok) throw httpError(500, (r.stderr || 'docker failed').trim());
   return { ok: true };
 }
 
-async function dockerLogs(id, lines = 200) {
+async function dockerLogs(host, id, lines = 200) {
   if (!DOCKER_ID_RE.test(id)) throw httpError(400, 'Invalid container id');
   const n = Math.max(1, Math.min(2000, Number(lines) || 200));
-  const r = await run('docker', ['logs', '--tail', String(n), '--timestamps', id], { timeout: 15000 });
+  const r = await host.runPriv('docker', ['logs', '--tail', String(n), '--timestamps', id], { timeout: 20000 });
   return { output: (r.stdout + r.stderr).slice(-500_000) };
 }
 
 // ======================= Files =======================
 
 class FileManager {
-  constructor(root) {
-    this.root = path.resolve(root);
-    this.rootSep = this.root.endsWith(path.sep) ? this.root : this.root + path.sep;
+  constructor(host, root) {
+    this.host = host;
+    this.fs = host.fs;
+    this.root = path.posix.resolve('/', root || '/');
+    this.rootSep = this.root.endsWith('/') ? this.root : this.root + '/';
   }
 
   inside(abs) { return abs === this.root || abs.startsWith(this.rootSep); }
@@ -102,44 +99,36 @@ class FileManager {
   /** Resolve a client-supplied path under the root, rejecting traversal and symlink escapes. */
   async resolve(rel, { mustExist = true } = {}) {
     const clean = String(rel || '').replace(/\0/g, '');
-    const abs = path.resolve(this.root, '.' + path.sep + clean);
+    const abs = path.posix.resolve(this.root, '.' + '/' + clean);
     if (!this.inside(abs)) throw httpError(400, 'Path is outside the allowed root');
-    const realRoot = await fsp.realpath(this.root);
-    const check = mustExist ? abs : path.dirname(abs);
+    let realRoot;
+    try { realRoot = await this.fs.realpath(this.root); } catch { throw httpError(404, `File manager root ${this.root} does not exist on this server`); }
     let real;
-    try { real = await fsp.realpath(check); } catch { throw httpError(404, 'Not found'); }
-    if (real !== realRoot && !real.startsWith(realRoot.endsWith(path.sep) ? realRoot : realRoot + path.sep)) {
-      throw httpError(400, 'Path escapes the allowed root');
+    try { real = await this.fs.realpath(mustExist ? abs : path.posix.dirname(abs)); } catch (e) {
+      throw httpError(e.code === 'EACCES' ? 403 : 404, e.code === 'EACCES' ? 'Permission denied' : 'Not found');
     }
+    const rr = realRoot.endsWith('/') ? realRoot : realRoot + '/';
+    if (real !== realRoot && !real.startsWith(rr)) throw httpError(400, 'Path escapes the allowed root');
     return abs;
   }
 
-  rel(abs) { return '/' + path.relative(this.root, abs).split(path.sep).join('/'); }
+  rel(abs) { return abs === this.root ? '/' : '/' + path.posix.relative(this.root, abs); }
 
   async list(rel) {
     const abs = await this.resolve(rel);
-    const st = await fsp.stat(abs);
-    if (!st.isDirectory()) throw httpError(400, 'Not a directory');
-    const names = await fsp.readdir(abs);
-    const entries = (await Promise.all(names.map(async (name) => {
-      try {
-        const s = await fsp.lstat(path.join(abs, name));
-        return {
-          name, type: s.isSymbolicLink() ? 'link' : s.isDirectory() ? 'dir' : 'file',
-          size: s.size, mtime: s.mtimeMs, mode: (s.mode & 0o777).toString(8),
-        };
-      } catch { return null; }
-    }))).filter(Boolean);
+    const st = await this.fs.stat(abs);
+    if (st.type !== 'dir') throw httpError(400, 'Not a directory');
+    const entries = await this.fs.readdir(abs);
     entries.sort((a, b) => (a.type === 'dir') === (b.type === 'dir') ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1);
     return { path: this.rel(abs), root: this.root, entries };
   }
 
   async read(rel, maxBytes = 2 * 1024 * 1024) {
     const abs = await this.resolve(rel);
-    const st = await fsp.stat(abs);
-    if (!st.isFile()) throw httpError(400, 'Not a file');
+    const st = await this.fs.stat(abs);
+    if (st.type !== 'file') throw httpError(400, 'Not a file');
     if (st.size > maxBytes) throw httpError(413, `File is larger than ${maxBytes / 1024 / 1024} MB; download it instead`);
-    const buf = await fsp.readFile(abs);
+    const buf = await this.fs.readFile(abs);
     if (buf.includes(0)) throw httpError(415, 'Binary file; download it instead');
     return { path: this.rel(abs), size: st.size, content: buf.toString('utf8') };
   }
@@ -147,13 +136,13 @@ class FileManager {
   async write(rel, content) {
     if (typeof content !== 'string') throw httpError(400, 'content must be a string');
     const abs = await this.resolve(rel, { mustExist: false });
-    await fsp.writeFile(abs, content);
+    await this.fs.writeFile(abs, content);
     return { ok: true };
   }
 
   async mkdir(rel) {
     const abs = await this.resolve(rel, { mustExist: false });
-    await fsp.mkdir(abs);
+    await this.fs.mkdir(abs);
     return { ok: true };
   }
 
@@ -161,50 +150,52 @@ class FileManager {
     const a = await this.resolve(from);
     const b = await this.resolve(to, { mustExist: false });
     if (a === this.root) throw httpError(400, 'Cannot move the root');
-    await fsp.rename(a, b);
+    await this.fs.rename(a, b);
     return { ok: true };
   }
 
   async remove(rel) {
     const abs = await this.resolve(rel);
     if (abs === this.root) throw httpError(400, 'Cannot delete the root');
-    await fsp.rm(abs, { recursive: true });
+    await this.fs.rm(abs);
     return { ok: true };
   }
 
   async chmod(rel, mode) {
     if (!/^[0-7]{3,4}$/.test(String(mode))) throw httpError(400, 'Invalid mode');
     const abs = await this.resolve(rel);
-    await fsp.chmod(abs, parseInt(mode, 8));
+    await this.fs.chmod(abs, parseInt(mode, 8));
     return { ok: true };
   }
 
   async downloadStream(rel) {
     const abs = await this.resolve(rel);
-    const st = await fsp.stat(abs);
-    if (!st.isFile()) throw httpError(400, 'Not a file');
-    return { abs, size: st.size, name: path.basename(abs), stream: fs.createReadStream(abs) };
+    const st = await this.fs.stat(abs);
+    if (st.type !== 'file') throw httpError(400, 'Not a file');
+    return { abs, size: st.size, name: path.posix.basename(abs), stream: this.fs.createReadStream(abs) };
   }
 
   async upload(dirRel, name, req, limit) {
     if (!name || /[\\/\0]/.test(name) || name === '.' || name === '..') throw httpError(400, 'Invalid file name');
     const dir = await this.resolve(dirRel);
-    if (!(await fsp.stat(dir)).isDirectory()) throw httpError(400, 'Target is not a directory');
-    const target = path.join(dir, name);
-    const tmp = `${target}.upload-${process.pid}`;
+    if ((await this.fs.stat(dir)).type !== 'dir') throw httpError(400, 'Target is not a directory');
+    const target = path.posix.join(dir, name);
+    const tmp = `${target}.upload-${process.pid}-${Date.now()}`;
     let size = 0;
-    await new Promise((resolve, reject) => {
-      const out = fs.createWriteStream(tmp);
-      req.on('data', (c) => {
-        size += c.length;
-        if (size > limit) { req.destroy(); out.destroy(); reject(httpError(413, 'Upload too large')); }
-      });
-      req.pipe(out);
-      out.on('finish', resolve);
-      out.on('error', reject);
-      req.on('error', reject);
-    }).catch(async (e) => { await fsp.rm(tmp, { force: true }); throw e; });
-    await fsp.rename(tmp, target);
+    const counter = new Transform({
+      transform(chunk, _enc, cb) {
+        size += chunk.length;
+        if (size > limit) cb(httpError(413, 'Upload too large')); else cb(null, chunk);
+      },
+    });
+    req.on('error', (e) => counter.destroy(e));
+    try {
+      await this.fs.writeFrom(tmp, req.pipe(counter));
+    } catch (e) {
+      await this.fs.rm(tmp).catch(() => {});
+      throw e;
+    }
+    await this.fs.rename(tmp, target);
     return { ok: true, size };
   }
 }
@@ -221,49 +212,35 @@ function filterLines(text, q) {
 }
 
 class LogReader {
-  constructor(dirs) { this.dirs = dirs.map((d) => path.resolve(d)); }
+  constructor(host, dirs) {
+    this.host = host;
+    this.dirs = dirs.map((d) => path.posix.resolve(d));
+  }
 
   async sources() {
     const files = [];
     for (const dir of this.dirs) {
-      let names;
-      try { names = await fsp.readdir(dir, { withFileTypes: true }); } catch { continue; }
-      for (const d of names) {
-        const p = path.join(dir, d.name);
-        try {
-          if (d.isFile()) { const s = await fsp.stat(p); files.push({ path: p, size: s.size, mtime: s.mtimeMs }); }
-          else if (d.isDirectory()) {
-            for (const sub of await fsp.readdir(p, { withFileTypes: true })) {
-              if (sub.isFile()) { const sp = path.join(p, sub.name); const s = await fsp.stat(sp); files.push({ path: sp, size: s.size, mtime: s.mtimeMs }); }
-            }
-          }
-        } catch { /* unreadable */ }
+      const r = await this.host.runPriv('find', [dir, '-maxdepth', '2', '-type', 'f', '-printf', '%p\t%s\t%T@\n'], { timeout: 15000 });
+      for (const line of r.stdout.split('\n')) {
+        const [p, size, mtime] = line.split('\t');
+        if (p && /^\d+$/.test(size)) files.push({ path: p, size: +size, mtime: Math.round(parseFloat(mtime) * 1000) });
       }
     }
     files.sort((a, b) => b.mtime - a.mtime);
-    const j = await run('journalctl', ['--version']);
-    return { journal: !j.missing && j.ok, files };
+    const j = await this.host.run('journalctl', ['--version']);
+    return { journal: !j.missing && j.ok, files: files.slice(0, 500) };
   }
 
   async file(p, lines = 300, q = '') {
-    const abs = path.resolve(String(p || ''));
-    let real;
-    try { real = await fsp.realpath(abs); } catch { throw httpError(404, 'Not found'); }
-    const allowed = this.dirs.some((d) => real.startsWith(d + path.sep));
-    if (!allowed) throw httpError(403, 'File is outside the allowed log directories');
-    const st = await fsp.stat(real);
-    if (!st.isFile()) throw httpError(400, 'Not a file');
+    const rp = await this.host.runPriv('realpath', ['-e', '--', String(p || '')]);
+    const real = rp.stdout.trim();
+    if (!rp.ok || !real) throw httpError(404, 'Not found');
+    if (!this.dirs.some((d) => real.startsWith(d + '/'))) throw httpError(403, 'File is outside the allowed log directories');
     if (/\.(gz|xz|bz2|zip|zst)$/.test(real)) throw httpError(415, 'Compressed logs are not supported');
     const n = Math.max(1, Math.min(5000, Number(lines) || 300));
-    const chunk = Math.min(st.size, 2 * 1024 * 1024);
-    const fh = await fsp.open(real, 'r');
-    try {
-      const buf = Buffer.alloc(chunk);
-      await fh.read(buf, 0, chunk, st.size - chunk);
-      let text = buf.toString('utf8');
-      text = filterLines(text, q);
-      return { output: text.split('\n').slice(-n).join('\n') };
-    } finally { await fh.close(); }
+    const r = await this.host.runPriv('tail', ['-c', String(2 * 1024 * 1024), '--', real], { timeout: 20000, maxBuffer: 4 * 1024 * 1024 });
+    if (!r.ok) throw httpError(/denied/i.test(r.stderr) ? 403 : 500, r.stderr.trim() || 'Could not read log file');
+    return { output: filterLines(r.stdout, q).split('\n').slice(-n).join('\n') };
   }
 
   async journal({ unit, lines = 300, priority, q } = {}) {
@@ -277,29 +254,28 @@ class LogReader {
       if (!PRIORITIES.includes(String(priority))) throw httpError(400, 'Invalid priority');
       args.push('-p', String(priority));
     }
-    const r = await runPriv('journalctl', args, { timeout: 15000 });
-    if (r.missing) throw httpError(501, 'journalctl is not available on this host');
+    const r = await this.host.runPriv('journalctl', args, { timeout: 20000 });
+    if (r.missing) throw httpError(501, 'journalctl is not available on this server');
     return { output: filterLines(r.stdout || r.stderr, q) };
   }
 }
 
 // ======================= Cron =======================
 
-async function readCrontab() {
-  const r = await run('crontab', ['-l']);
-  if (r.missing) {
-    return { available: false, content: '', hint: 'cronie is not installed (Amazon Linux 2023 does not ship it). Install it: sudo dnf install -y cronie && sudo systemctl enable --now crond' };
-  }
+const CRON_HINT = 'cronie is not installed (Amazon Linux 2023 does not ship it). Install it: sudo dnf install -y cronie && sudo systemctl enable --now crond';
+
+async function readCrontab(host) {
+  const r = await host.run('crontab', ['-l']);
+  if (r.missing) return { available: false, content: '', hint: CRON_HINT };
   return { available: true, content: r.ok ? r.stdout : '' };
 }
 
 function validateCrontab(content) {
   const errors = [];
-  const lines = String(content).split('\n');
-  lines.forEach((line, i) => {
+  String(content).split('\n').forEach((line, i) => {
     const t = line.trim();
     if (!t || t.startsWith('#')) return;
-    if (/^[A-Za-z_][A-Za-z0-9_]*\s*=/.test(t)) return; // env assignment
+    if (/^[A-Za-z_][A-Za-z0-9_]*\s*=/.test(t)) return;
     if (/^@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)\s+\S+/.test(t)) return;
     const parts = t.split(/\s+/);
     if (parts.length < 6 || !parts.slice(0, 5).every((f) => /^[\d*,/\-A-Za-z?LW#]+$/.test(f))) {
@@ -309,45 +285,14 @@ function validateCrontab(content) {
   return errors;
 }
 
-async function writeCrontab(content) {
+async function writeCrontab(host, content) {
   const errors = validateCrontab(content);
   if (errors.length) throw httpError(400, errors.join('\n'));
   const body = String(content).replace(/\r\n/g, '\n').replace(/\n*$/, '\n');
-  const { spawn } = require('child_process');
-  await new Promise((resolve, reject) => {
-    const p = spawn('crontab', ['-'], { stdio: ['pipe', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d; });
-    p.on('error', (e) => reject(httpError(501, e.code === 'ENOENT' ? 'crontab is not available' : e.message)));
-    p.on('close', (code) => (code === 0 ? resolve() : reject(httpError(400, err.trim() || 'crontab rejected the file'))));
-    p.stdin.end(body);
-  });
+  const r = await host.run('crontab', ['-'], { stdin: body });
+  if (r.missing) throw httpError(501, 'crontab is not available');
+  if (!r.ok) throw httpError(400, r.stderr.trim() || 'crontab rejected the file');
   return { ok: true };
-}
-
-// ======================= Terminal (one-shot commands) =======================
-
-function runCommand(command, { timeoutMs = 30000, cwd } = {}) {
-  const { spawn } = require('child_process');
-  const limit = Math.min(Math.max(Number(timeoutMs) || 30000, 1000), 120000);
-  return new Promise((resolve) => {
-    const started = Date.now();
-    const p = spawn('bash', ['-c', command], { cwd, env: { ...process.env, TERM: 'dumb' }, stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let truncated = false;
-    let timedOut = false;
-    const take = (d) => {
-      if (out.length < 512 * 1024) out += d; else truncated = true;
-    };
-    p.stdout.on('data', take);
-    p.stderr.on('data', take);
-    const timer = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, limit);
-    p.on('error', (e) => { clearTimeout(timer); resolve({ output: e.message, code: null, ms: 0, timedOut: false, truncated: false }); });
-    p.on('close', (code, signal) => {
-      clearTimeout(timer);
-      resolve({ output: out, code, signal, ms: Date.now() - started, timedOut, truncated });
-    });
-  });
 }
 
 module.exports = {
@@ -355,5 +300,4 @@ module.exports = {
   dockerOverview, dockerAction, dockerLogs,
   FileManager, LogReader, filterLines,
   readCrontab, writeCrontab, validateCrontab,
-  runCommand,
 };

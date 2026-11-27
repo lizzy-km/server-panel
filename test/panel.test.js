@@ -13,8 +13,11 @@ const pkg = require('../server/lib/pkg');
 let app, base, dataDir, filesDir, outside;
 let cookie = '';
 
+const GLOBAL = /^\/api\/(session|setup|login|logout|account|users|audit|servers|alerts\/thresholds)/;
+const scopedUrl = (url) => (GLOBAL.test(url) ? url : url + (url.includes('?') ? '&' : '?') + 'server=local');
+
 async function call(method, url, body, { cookieOverride, headers = {} } = {}) {
-  const res = await fetch(base + url, {
+  const res = await fetch(base + scopedUrl(url), {
     method,
     headers: { 'X-Panel-Request': '1', ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}), ...(cookieOverride ?? cookie ? { Cookie: cookieOverride ?? cookie } : {}), ...headers },
     body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -32,14 +35,13 @@ before(async () => {
   fs.writeFileSync(path.join(outside, 'secret.txt'), 'top secret');
   fs.symlinkSync(outside, path.join(filesDir, 'escape'));
   fs.writeFileSync(path.join(filesDir, 'hello.txt'), 'hello');
-  app = createApp({ dataDir, filesRoot: filesDir, port: 0, host: '127.0.0.1', logDirs: [filesDir] });
-  app.sampler.start();
+  app = createApp({ dataDir, filesRoot: filesDir, port: 0, host: '127.0.0.1', logDirs: [filesDir], enableLocal: true });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${app.server.address().port}`;
 });
 
 after(() => {
-  app.sampler.stop();
+  app.servers.closeAll();
   app.server.close();
   for (const d of [dataDir, filesDir, outside]) fs.rmSync(d, { recursive: true, force: true });
 });
@@ -103,10 +105,10 @@ test('files: CRUD works inside the root', async () => {
   assert.equal((await call('POST', '/api/files/chmod', { path: '/sub/n.txt', mode: '600' })).status, 200);
   assert.equal((await call('POST', '/api/files/delete', { path: '/sub' })).status, 200);
   assert.ok(!fs.existsSync(path.join(filesDir, 'sub')));
-  const up = await fetch(base + '/api/files/upload?path=/&name=up.bin', { method: 'POST', headers: { 'X-Panel-Request': '1', Cookie: cookie }, body: Buffer.from([1, 2, 3, 0]) });
+  const up = await fetch(base + '/api/files/upload?server=local&path=/&name=up.bin', { method: 'POST', headers: { 'X-Panel-Request': '1', Cookie: cookie }, body: Buffer.from([1, 2, 3, 0]) });
   assert.equal(up.status, 200);
   assert.equal(fs.statSync(path.join(filesDir, 'up.bin')).size, 4);
-  const dl = await fetch(base + '/api/files/download?path=/up.bin', { headers: { Cookie: cookie } });
+  const dl = await fetch(base + '/api/files/download?server=local&path=/up.bin', { headers: { Cookie: cookie } });
   assert.equal((await dl.arrayBuffer()).byteLength, 4);
   assert.equal((await call('GET', '/api/files/read?path=/up.bin')).status, 415);
 });
@@ -121,6 +123,9 @@ test('files: traversal and symlink escapes are blocked', async () => {
   assert.ok(!fs.existsSync(path.join(outside, 'pwn.txt')));
   assert.equal((await call('POST', '/api/files/delete', { path: '/' })).status, 400);
   assert.equal((await call('POST', '/api/files/upload?path=/&name=..%2Fx', undefined)).status, 400);
+  assert.equal((await call('GET', '/api/files/list?path=/')).status, 200);
+  const noServer = await fetch(base + '/api/files/list?path=/', { headers: { Cookie: cookie } });
+  assert.equal(noServer.status, 400); // scoped routes refuse to guess which server you meant
 });
 
 test('logs: only allow-listed directories', async () => {

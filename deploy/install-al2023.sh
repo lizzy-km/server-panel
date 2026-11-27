@@ -1,25 +1,32 @@
 #!/usr/bin/env bash
-# Install Server Panel on Amazon Linux 2023.
+# Install Server Panel on Amazon Linux 2023 (the machine that RUNS the panel).
 #
-#   sudo ./deploy/install-al2023.sh [--with-cron] [--with-docker] [--no-sudo]
+#   sudo ./deploy/install-al2023.sh [--manage-local [--with-cron] [--with-docker]]
 #
-#   --with-cron    install + enable cronie (AL2023 does not ship it) so the Cron page works
-#   --with-docker  install Docker and let the panel user talk to it
-#   --no-sudo      do not install the sudoers rules (panel then cannot control services / run dnf)
+# By default the panel only manages remote servers that you add in the UI with an address and an
+# SSH key (.pem / .ppk). Nothing is granted on this machine itself.
 #
-# Re-running upgrades the code in /opt/server-panel and keeps /var/lib/server-panel (users, audit log).
+#   --manage-local  ALSO let the panel manage this machine: enables PANEL_ENABLE_LOCAL and installs
+#                   narrow sudoers rules (systemctl, journalctl, dnf) for the 'panel' user
+#   --with-cron     (with --manage-local) install + enable cronie so the Cron page works here
+#   --with-docker   (with --manage-local) install Docker and let the panel user use it
+#
+# Re-running upgrades the code in /opt/server-panel and keeps /var/lib/server-panel (users, servers, audit log).
 set -euo pipefail
 
-WITH_CRON=0; WITH_DOCKER=0; WITH_SUDO=1
+MANAGE_LOCAL=0; WITH_CRON=0; WITH_DOCKER=0
 for a in "$@"; do
   case "$a" in
+    --manage-local) MANAGE_LOCAL=1 ;;
     --with-cron) WITH_CRON=1 ;;
     --with-docker) WITH_DOCKER=1 ;;
-    --no-sudo) WITH_SUDO=0 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
     *) echo "unknown option: $a" >&2; exit 2 ;;
   esac
 done
+if [ "$MANAGE_LOCAL" -eq 0 ] && { [ "$WITH_CRON" -eq 1 ] || [ "$WITH_DOCKER" -eq 1 ]; }; then
+  echo "--with-cron / --with-docker only apply together with --manage-local" >&2; exit 2
+fi
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo $0" >&2; exit 1; }
 
@@ -33,35 +40,21 @@ APP=/opt/server-panel
 DATA=/var/lib/server-panel
 ENVFILE=/etc/server-panel.env
 
-echo "==> Installing Node.js"
-if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ]; then
-  dnf install -y nodejs22 || dnf install -y nodejs20
+echo "==> Installing Node.js and npm"
+if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ] || ! command -v npm >/dev/null 2>&1; then
+  dnf install -y nodejs22 nodejs22-npm || dnf install -y nodejs20 nodejs20-npm
 fi
 NODE_BIN="$(command -v node)"
-echo "    using $NODE_BIN ($(node -v))"
-
-if [ "$WITH_CRON" -eq 1 ]; then
-  echo "==> Installing cronie"
-  dnf install -y cronie
-  systemctl enable --now crond
-fi
+echo "    using $NODE_BIN ($(node -v)), npm $(npm -v)"
 
 echo "==> Creating service user"
 id panel >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell /sbin/nologin panel
 install -d -o panel -g panel -m 0700 "$DATA"
 
-if [ "$WITH_DOCKER" -eq 1 ]; then
-  echo "==> Installing Docker"
-  dnf install -y docker
-  systemctl enable --now docker
-  usermod -aG docker panel
-fi
-# let the panel read the journal without sudo as well
-usermod -aG systemd-journal panel 2>/dev/null || true
-
 echo "==> Copying application to $APP"
 install -d -m 0755 "$APP"
-cp -a "$SRC/server" "$SRC/public" "$SRC/package.json" "$APP/"
+cp -a "$SRC/server" "$SRC/public" "$SRC/package.json" "$SRC/package-lock.json" "$APP/"
+( cd "$APP" && npm ci --omit=dev --omit=optional --no-audit --no-fund --loglevel=error )
 chown -R root:root "$APP"
 
 if [ ! -f "$ENVFILE" ]; then
@@ -71,21 +64,43 @@ if [ ! -f "$ENVFILE" ]; then
 PANEL_HOST=127.0.0.1
 PANEL_PORT=8080
 PANEL_DATA_DIR=$DATA
-# Root of the file manager (the panel user must be able to read/write what you want to manage):
-#PANEL_FILES_ROOT=/home/ec2-user
 # Set to true once you serve the panel over HTTPS:
 #PANEL_SECURE_COOKIES=true
 EOF
   chmod 0640 "$ENVFILE"; chgrp panel "$ENVFILE"
 fi
 
-if [ "$WITH_SUDO" -eq 1 ]; then
+# Encrypt stored SSH keys with a secret that lives OUTSIDE the data directory (so a copy of
+# /var/lib/server-panel alone is useless). Never add one if keys were already encrypted with master.key.
+if ! grep -q '^PANEL_SECRET=' "$ENVFILE" && [ ! -f "$DATA/master.key" ]; then
+  echo "==> Generating PANEL_SECRET (back up $ENVFILE: without it stored SSH keys cannot be decrypted)"
+  printf 'PANEL_SECRET=%s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" >> "$ENVFILE"
+fi
+
+if [ "$MANAGE_LOCAL" -eq 1 ]; then
+  echo "==> Enabling management of this machine"
+  grep -q '^PANEL_ENABLE_LOCAL=' "$ENVFILE" || echo 'PANEL_ENABLE_LOCAL=true' >> "$ENVFILE"
+  sed -i 's/^PANEL_ENABLE_LOCAL=.*/PANEL_ENABLE_LOCAL=true/' "$ENVFILE"
+  usermod -aG systemd-journal panel 2>/dev/null || true
+
+  if [ "$WITH_CRON" -eq 1 ]; then
+    echo "==> Installing cronie"
+    dnf install -y cronie
+    systemctl enable --now crond
+  fi
+  if [ "$WITH_DOCKER" -eq 1 ]; then
+    echo "==> Installing Docker"
+    dnf install -y docker
+    systemctl enable --now docker
+    usermod -aG docker panel
+  fi
+
   echo "==> Installing sudoers rules (/etc/sudoers.d/server-panel)"
   SYSTEMCTL="$(command -v systemctl)"; JOURNALCTL="$(command -v journalctl)"; DNF="$(command -v dnf)"
   TMP="$(mktemp)"
   cat > "$TMP" <<EOF
-# Server Panel: narrow privilege delegation. Anyone who is a panel *admin* can therefore
-# start/stop/enable system services, read the journal and run dnf upgrades as root.
+# Server Panel: narrow privilege delegation for managing THIS machine. Anyone who is a panel *admin*
+# can therefore start/stop/enable system services, read the journal and run dnf upgrades as root.
 Defaults:panel !requiretty
 panel ALL=(root) NOPASSWD: $SYSTEMCTL start *, $SYSTEMCTL stop *, $SYSTEMCTL restart *, $SYSTEMCTL reload *, $SYSTEMCTL enable *, $SYSTEMCTL disable *
 panel ALL=(root) NOPASSWD: $JOURNALCTL --no-pager *
@@ -115,13 +130,14 @@ if [ -n "$TOKEN" ]; then
 fi
 cat <<EOF
 
-The panel listens on 127.0.0.1:$PORT only. Do NOT open that port in your security group.
-Reach it through a tunnel from your workstation:
+The panel listens on 127.0.0.1:$PORT only. Reach it through a tunnel from your workstation:
 
-  SSH:  ssh -L $PORT:127.0.0.1:$PORT ec2-user@<instance-ip>
-  SSM:  aws ssm start-session --target <instance-id> \\
+  SSH:  ssh -L $PORT:127.0.0.1:$PORT ec2-user@<this-instance-ip>
+  SSM:  aws ssm start-session --target <this-instance-id> \\
           --document-name AWS-StartPortForwardingSession \\
           --parameters '{"portNumber":["$PORT"],"localPortNumber":["$PORT"]}'
 
-then browse to http://localhost:$PORT
+then browse to http://localhost:$PORT, create the admin account and use "Servers → Add server"
+to connect the machines you want to manage (address + .pem/.ppk key). Each managed server must allow
+SSH from THIS machine (security group inbound rule for port 22 from this instance's IP / security group).
 EOF
