@@ -71,10 +71,17 @@ function createApp(overrides = {}) {
   });
 
   // --- session / auth ---
+  // which code is running (a restart is needed after updating the files)
+  const appVersion = (() => {
+    let v = require('../package.json').version;
+    try { const sha = require('child_process').execFileSync('git', ['-C', path.join(__dirname, '..'), 'rev-parse', '--short', 'HEAD'], { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); if (sha) v += ` · ${sha}`; } catch { /* not a git checkout */ }
+    return v;
+  })();
   route('GET', '/api/session', 'public', async (ctx) => ({
     setupRequired: auth.needsSetup(),
     user: ctx.user ? auth.publicUser(ctx.user) : null,
     features: { exec: config.enableExec, local: config.enableLocal, vault: vault.source },
+    version: appVersion,
   }));
 
   route('POST', '/api/setup', 'public', async (ctx) => {

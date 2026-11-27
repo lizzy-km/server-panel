@@ -283,6 +283,7 @@ function render() {
     state.servers.length ? state.servers.map((x) => h('option', { value: x.id, selected: x.id === state.server }, `${x.name}${x.kind === 'local' ? '' : ` — ${x.host}`}`)) : h('option', { value: '' }, 'No servers yet'));
   const side = h('aside', { class: 'side', id: 'side' },
     h('div', { class: 'brand' }, h('span', { class: 'logo' }, h('i')), 'Server Panel'),
+    state.version ? h('div', { class: 'muted', style: { fontSize: '11px', margin: '-6px 0 8px 2px' }, title: 'The version of the panel that is running. After updating the files, restart the panel to run the new version.' }, `version ${state.version}`) : null,
     h('div', { class: 'server-pick' }, h('label', {}, 'Server'), picker),
     h('nav', { class: 'nav' }, items.map((n) => n.sep ? h('div', { class: 'sep' }) :
       h('a', { href: `#/${n.id}`, class: n.id === item.id ? 'active' : '', onclick: () => side.classList.remove('open') }, h('span', { class: 'ico' }, n.icon), n.label))),
@@ -1065,7 +1066,7 @@ function pageAudit() {
   try { const t = localStorage.getItem('panel-theme'); if (t) document.documentElement.dataset.theme = t; } catch { /* ignore */ }
   try {
     const s = await api('/api/session');
-    state.user = s.user; state.setupRequired = s.setupRequired; state.features = s.features;
+    state.user = s.user; state.setupRequired = s.setupRequired; state.features = s.features; state.version = s.version;
     if (s.user) await loadServers();
   } catch (e) { toast(e.message, true); }
   window.addEventListener('hashchange', render);
