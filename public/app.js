@@ -188,6 +188,7 @@ const NAV = [
   { id: 'dashboard', label: 'Dashboard', icon: '▦', page: () => pageDashboard() },
   { id: 'processes', label: 'Processes', icon: '⚙', page: () => pageProcesses() },
   { id: 'services', label: 'Services', icon: '⏻', page: () => pageServices() },
+  { id: 'packages', label: 'Updates', icon: '⬆', page: () => pagePackages() },
   { id: 'docker', label: 'Docker', icon: '▣', page: () => pageDocker() },
   { id: 'network', label: 'Network', icon: '⇄', page: () => pageNetwork() },
   { sep: true, admin: true },
@@ -329,6 +330,8 @@ function pageDashboard() {
       ['Hostname', i.hostname], ['OS', i.os], ['Kernel', `${i.kernel} (${i.arch})`], ['CPU', `${i.cpuModel} × ${i.cpuCount}`],
       ['Uptime', fmt.uptime(i.uptime)], ['Booted', fmt.date(i.bootTime)], ['Runtime', `Node ${i.node} as ${i.user}`],
       ['Addresses', i.interfaces.filter((x) => !x.internal && x.family === 'IPv4').map((x) => `${x.address} (${x.name})`).join(', ') || '–'],
+      ...(sys.aws ? [['EC2 instance', `${sys.aws.instanceId} · ${sys.aws.instanceType}`], ['Zone', `${sys.aws.availabilityZone} (${sys.aws.region})`],
+        ['Public IP', sys.aws.publicIp || '–'], ['AMI', sys.aws.amiId || '–']] : []),
     ].map(([k, v]) => h('tr', {}, h('td', { class: 'muted' }, k), h('td', { class: 'wrap' }, v))))));
     disksBox.replaceChildren(...(sys.disks.length ? sys.disks.map((d) => h('div', { style: { marginBottom: '12px' } },
       h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('strong', {}, d.mount), h('span', { class: 'muted' }, `${fmt.bytes(d.used)} / ${fmt.bytes(d.total)} · ${d.type}`)),
@@ -430,6 +433,61 @@ function pageServices() {
   }
   poll(load, 10000);
   return h('div', {}, pageHeader('Services', 'systemd units'), h('div', { class: 'toolbar' }, search, only), holder);
+}
+
+// ---------------------------------------------------------------- packages (dnf)
+function pagePackages() {
+  const isAdmin = state.user.role === 'admin';
+  const box = h('div', { class: 'card' }), banner = h('div', {});
+  const search = h('input', { class: 'grow', placeholder: 'Filter packages…', oninput: () => draw() });
+  const sort = { key: 'name', dir: 'asc', onSort(k) { sort.dir = sort.key === k && sort.dir === 'asc' ? 'desc' : 'asc'; sort.key = k; draw(); } };
+  let data = null;
+  const refresh = h('button', {}, 'Check for updates');
+  const secBtn = h('button', { class: 'primary', disabled: true }, 'Install security updates');
+  const allBtn = h('button', { class: 'danger', disabled: true }, 'Update everything');
+
+  async function run(body, label) {
+    if (!(await confirmDialog(label + '?', 'This runs dnf on the server and can take several minutes. Services may restart.', 'Run', false))) return;
+    toast('Running dnf…');
+    for (const b of [refresh, secBtn, allBtn]) b.disabled = true;
+    try {
+      const r = await api('/api/packages/upgrade', { method: 'POST', body });
+      modal('dnf output', h('pre', { class: 'out' }, r.output || '(no output)'), { wide: true, actions: [{ label: 'Close', onclick: (c) => c() }] });
+    } catch (e) { fail(e); }
+    for (const b of [refresh, secBtn, allBtn]) b.disabled = false;
+    load(true);
+  }
+  secBtn.onclick = () => run({ securityOnly: true }, 'Install security updates');
+  allBtn.onclick = () => run({}, 'Update all packages');
+  refresh.onclick = () => load(true);
+
+  function draw() {
+    if (!data) return;
+    banner.replaceChildren();
+    if (data.rebootRequired) banner.append(h('div', { class: 'alert' }, '⚠ A reboot is recommended (core packages were updated since boot).'));
+    if (data.error) { box.replaceChildren(h('div', { class: 'notice' }, data.error)); return; }
+    secBtn.disabled = !data.securityCount; allBtn.disabled = !data.updates.length;
+    box.replaceChildren(h('h2', {}, `${data.updates.length} update${data.updates.length === 1 ? '' : 's'} available`, h('span', { class: 'muted' }, `${data.securityCount} security`)),
+      dataTable({
+        columns: [
+          { key: 'name', label: 'Package' }, { key: 'version', label: 'New version' }, { key: 'arch', label: 'Arch' }, { key: 'repo', label: 'Repo' },
+          { key: 'security', label: 'Security', render: (u) => u.security ? h('span', { class: 'badge ' + (['Critical', 'Important'].includes(u.security) ? 'bad' : 'warn'), title: u.advisory }, u.security) : '–' },
+        ],
+        rows: data.updates, sort, filterText: search.value, empty: 'System is up to date 🎉',
+        rowActions: isAdmin ? (u) => h('button', { class: 'sm', onclick: () => run({ packages: [u.name] }, `Update ${u.name}`) }, 'Update') : null,
+      }));
+  }
+  async function load(force) {
+    box.replaceChildren(h('div', { class: 'empty' }, force ? 'Refreshing repository metadata…' : 'Checking for updates…'));
+    try {
+      const r = await api('/api/packages' + (force ? '?refresh=1' : ''));
+      if (!r.available) { box.replaceChildren(h('div', { class: 'notice' }, r.error)); return; }
+      data = r; draw();
+    } catch (e) { box.replaceChildren(h('div', { class: 'notice' }, e.message)); }
+  }
+  load(false);
+  return h('div', {}, pageHeader('System updates', 'dnf updates for Amazon Linux 2023', refresh, isAdmin ? secBtn : null, isAdmin ? allBtn : null),
+    banner, h('div', { class: 'toolbar' }, search), box);
 }
 
 // ---------------------------------------------------------------- docker
@@ -627,7 +685,7 @@ function pageCron() {
   const save = h('button', { class: 'primary' }, 'Save crontab');
   save.onclick = act(save, async () => { await api('/api/cron', { method: 'PUT', body: { content: ta.value } }); toast('Crontab saved'); });
   (async () => {
-    try { const r = await api('/api/cron'); if (!r.available) { ta.disabled = true; save.disabled = true; info.textContent = 'crontab is not installed on this host.'; } ta.value = r.content; } catch (e) { fail(e); }
+    try { const r = await api('/api/cron'); if (!r.available) { ta.disabled = true; save.disabled = true; info.textContent = r.hint || 'crontab is not installed on this host.'; } ta.value = r.content; } catch (e) { fail(e); }
   })();
   const examples = h('div', { class: 'muted', style: { marginTop: '10px', fontSize: '12px' } }, 'Examples: ', h('code', {}, '*/5 * * * * /usr/local/bin/task.sh'), ' · ', h('code', {}, '0 3 * * 1 /usr/bin/backup'), ' · ', h('code', {}, '@reboot /opt/start.sh'));
   return h('div', {}, pageHeader('Cron jobs', null, save), info, ta, examples);

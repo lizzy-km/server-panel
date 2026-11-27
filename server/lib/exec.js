@@ -22,4 +22,18 @@ function run(cmd, args = [], opts = {}) {
   });
 }
 
-module.exports = { run };
+const canSudo = () => typeof process.getuid === 'function' && process.getuid() !== 0 && process.env.PANEL_USE_SUDO !== 'false';
+
+/**
+ * Run a command with root privileges when the panel is not root (via `sudo -n`, never prompting).
+ * If sudo is missing or not permitted for this command, fall back to running it directly,
+ * so unprivileged-but-sufficient setups (e.g. docker group, systemd-journal group) still work.
+ */
+async function runPriv(cmd, args = [], opts = {}) {
+  if (!canSudo()) return run(cmd, args, opts);
+  const r = await run('sudo', ['-n', cmd, ...args], opts);
+  if (r.ok || !(r.missing || /^sudo: /m.test(r.stderr))) return r;
+  return run(cmd, args, opts);
+}
+
+module.exports = { run, runPriv };

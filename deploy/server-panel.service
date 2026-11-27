@@ -1,0 +1,21 @@
+[Unit]
+Description=Server Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=panel
+Group=panel
+# Add "docker" here if you want Docker management without sudo:
+# SupplementaryGroups=docker systemd-journal
+WorkingDirectory=/opt/server-panel
+EnvironmentFile=/etc/server-panel.env
+ExecStart=/usr/bin/node /opt/server-panel/server/index.js
+Restart=on-failure
+RestartSec=3
+PrivateTmp=true
+# NOTE: do not set NoNewPrivileges=true — it would disable the sudo rules the panel uses
+# for systemctl / journalctl / dnf.
+
+[Install]
+WantedBy=multi-user.target

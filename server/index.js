@@ -7,6 +7,8 @@ const { Auth, httpError, safeEq } = require('./lib/auth');
 const { sendJson, readJson, parseCookies, serveStatic, applyHeaders } = require('./lib/http');
 const sys = require('./lib/sys');
 const ops = require('./lib/ops');
+const pkg = require('./lib/pkg');
+const { InstanceMetadata } = require('./lib/aws');
 
 const COOKIE = 'panel_session';
 
@@ -19,6 +21,7 @@ function createApp(overrides = {}) {
   auth.ensureSetupToken();
   const files = new ops.FileManager(config.filesRoot);
   const logs = new ops.LogReader(config.logDirs);
+  const instance = new InstanceMetadata();
 
   // ---- route table: [method, path, permission, handler] ----
   // permission: 'public' | 'user' (any signed-in) | 'admin'
@@ -83,7 +86,7 @@ function createApp(overrides = {}) {
   });
 
   // --- overview / metrics ---
-  route('GET', '/api/system', 'user', async () => ({ info: sys.systemInfo(), disks: await sys.disks(), latest: sampler.latest() }));
+  route('GET', '/api/system', 'user', async () => ({ info: sys.systemInfo(), disks: await sys.disks(), latest: sampler.latest(), aws: instance.value }));
   route('GET', '/api/metrics', 'user', async (ctx) => {
     const since = Number(q(ctx, 'since', 0));
     const h = sampler.history.filter((p) => p.t > since).map(({ netTotals, ...rest }) => rest);
@@ -132,6 +135,14 @@ function createApp(overrides = {}) {
     const r = await ops.serviceAction(String(b.unit || ''), String(b.action || ''));
     note(ctx, 'service_' + b.action, b.unit);
     return r;
+  });
+
+  // --- packages (dnf) ---
+  route('GET', '/api/packages', 'user', async (ctx) => pkg.listUpdates({ refresh: q(ctx, 'refresh') === '1' }));
+  route('POST', '/api/packages/upgrade', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    note(ctx, 'package_upgrade', b.securityOnly ? 'security updates' : (Array.isArray(b.packages) && b.packages.length ? b.packages.slice(0, 20).map(String).join(' ') : 'all packages'));
+    return pkg.upgrade({ packages: b.packages || [], securityOnly: !!b.securityOnly });
   });
 
   // --- docker ---
@@ -289,12 +300,13 @@ function createApp(overrides = {}) {
 
   const server = http.createServer((req, res) => { handle(req, res); });
   server.requestTimeout = 0; // allow long uploads; body size is limited separately
-  return { server, config, sampler, auth, store, audit };
+  return { server, config, sampler, auth, store, audit, instance };
 }
 
 function main() {
   const app = createApp();
   app.sampler.start();
+  app.instance.start();
   app.server.listen(app.config.port, app.config.host, () => {
     const { host, port } = app.config;
     console.log(`Server Panel listening on http://${host}:${port}`);

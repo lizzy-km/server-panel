@@ -2,7 +2,7 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
-const { run } = require('./exec');
+const { run, runPriv } = require('./exec');
 const { httpError } = require('./auth');
 
 // ======================= systemd services =======================
@@ -32,7 +32,7 @@ async function listServices() {
 async function serviceAction(unit, action) {
   if (!UNIT_RE.test(unit)) throw httpError(400, 'Invalid unit name');
   if (!SERVICE_ACTIONS.includes(action)) throw httpError(400, 'Invalid action');
-  const r = await run('systemctl', [action, unit], { timeout: 60000 });
+  const r = await runPriv('systemctl', [action, unit], { timeout: 60000 });
   if (!r.ok) throw httpError(500, (r.stderr || r.stdout || 'systemctl failed').trim());
   return { ok: true };
 }
@@ -277,7 +277,7 @@ class LogReader {
       if (!PRIORITIES.includes(String(priority))) throw httpError(400, 'Invalid priority');
       args.push('-p', String(priority));
     }
-    const r = await run('journalctl', args, { timeout: 15000 });
+    const r = await runPriv('journalctl', args, { timeout: 15000 });
     if (r.missing) throw httpError(501, 'journalctl is not available on this host');
     return { output: filterLines(r.stdout || r.stderr, q) };
   }
@@ -287,7 +287,9 @@ class LogReader {
 
 async function readCrontab() {
   const r = await run('crontab', ['-l']);
-  if (r.missing) return { available: false, content: '' };
+  if (r.missing) {
+    return { available: false, content: '', hint: 'cronie is not installed (Amazon Linux 2023 does not ship it). Install it: sudo dnf install -y cronie && sudo systemctl enable --now crond' };
+  }
   return { available: true, content: r.ok ? r.stdout : '' };
 }
 

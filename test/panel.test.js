@@ -8,6 +8,7 @@ const { createApp } = require('../server/index');
 const { hashPassword, verifyPassword } = require('../server/lib/auth');
 const sys = require('../server/lib/sys');
 const ops = require('../server/lib/ops');
+const pkg = require('../server/lib/pkg');
 
 let app, base, dataDir, filesDir, outside;
 let cookie = '';
@@ -205,4 +206,28 @@ test('parsers: df, ps, ss, systemd units', () => {
   assert.deepEqual([ps[0].pid, ps[0].cpu, ps[0].rss, ps[0].command], [12, 1.5, 2048 * 1024, 'sshd -D']);
   assert.equal(sys.parseSs('tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=7,fd=3))')[0].pid, 7);
   assert.equal(ops.parseUnits('ssh.service loaded active running OpenBSD Secure Shell server\n')[0].description, 'OpenBSD Secure Shell server');
+});
+
+test('dnf parsers handle Amazon Linux 2023 output', () => {
+  const upd = pkg.parseCheckUpdate('\nkernel.x86_64                6.1.79-99.167.amzn2023   amazonlinux\nopenssl-libs.x86_64   1:3.0.8-1.amzn2023.0.4  amazonlinux\n\nObsoleting Packages\nfoo.x86_64 1.0 amazonlinux\n    old.x86_64 0.9 @amazonlinux\n');
+  assert.deepEqual(upd.map((u) => u.name), ['kernel', 'openssl-libs']);
+  assert.equal(upd[1].version, '1:3.0.8-1.amzn2023.0.4');
+  const sec = pkg.parseSecurity('ALAS2023-2024-533 Important/Sec. kernel-6.1.79-99.167.amzn2023.x86_64\nALAS2023-2024-001 low/Sec. openssl-libs-1:3.0.8-1.amzn2023.0.4.x86_64\n');
+  assert.equal(sec.kernel.severity, 'Important');
+  assert.equal(sec['openssl-libs'].severity, 'Low');
+});
+
+test('packages API: listing works without dnf and upgrade input is validated', async () => {
+  const l = await call('GET', '/api/packages');
+  assert.equal(l.status, 200);
+  assert.ok(Array.isArray(l.json.updates));
+  for (const bad of [['--installroot=/x'], ['/tmp/evil.rpm'], ['a b'], 'notalist']) {
+    assert.equal((await call('POST', '/api/packages/upgrade', { packages: bad })).status, 400, JSON.stringify(bad));
+  }
+});
+
+test('cron endpoint explains how to install cronie when missing', async () => {
+  const r = await call('GET', '/api/cron');
+  assert.equal(r.status, 200);
+  if (!r.json.available) assert.match(r.json.hint, /dnf install -y cronie/);
 });
