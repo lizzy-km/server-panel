@@ -124,7 +124,7 @@ apply_release() {
 ${healthFn(app)}
 on_exit() {
   rc=$?
-  if [ "$rc" -ne 0 ] && [ -z "$STATE" ]; then echo "@@STATE failed"; if [ "$ACTIVATED" = 0 ] && [ -n "$REL" ]; then rm -rf -- "$REL"; fi; fi
+  if [ "$rc" -ne 0 ] && [ -z "$STATE" ]; then echo "@@STATE failed"; if [ "$ACTIVATED" = 0 ] && [ -n "$REL" ]; then priv rm -rf -- "$REL"; fi; fi
   rm -rf -- "$TMP"
 }
 trap on_exit EXIT
@@ -143,6 +143,30 @@ export GIT_SSH_COMMAND="ssh -i $TMP/key -o IdentitiesOnly=yes -o StrictHostKeyCh
   }
   return '';
 };
+
+
+const PHP_PREFLIGHT = `step "Checking the PHP version and extensions this app needs"
+if [ -f "$REL/composer.lock" ] && command -v composer >/dev/null 2>&1; then
+  PHPCHECK=$(as_app 'composer check-platform-reqs --lock --no-dev --format=json 2>/dev/null' || true)
+  SUMMARY=$(printf '%s' "$PHPCHECK" | php -r '$j = json_decode(stream_get_contents(STDIN), true); if (!is_array($j)) exit(0); foreach ($j as $r) { $st = $r["status"] ?? ""; if ($st !== "failed" && $st !== "missing") continue; $n = $r["name"] ?? "?"; $need = $r["failed_requirement"]["constraint"] ?? ""; $src = $r["failed_requirement"]["source"] ?? "the app"; if ($n === "php") echo "PHP " . $need . " is required by " . $src . " but this server has PHP " . ($r["version"] ?? "?") . "\\n"; else echo "The PHP extension " . preg_replace("/^ext-/", "", $n) . " is required by " . $src . " but is not installed on this server\\n"; }' 2>/dev/null || true)
+  if [ -n "$SUMMARY" ]; then
+    echo "!! This server cannot run this app as it is:"
+    printf '%s\\n' "$SUMMARY" | sed 's/^/   - /'
+    NEED=$(printf '%s' "$PHPCHECK" | php -r '$j = json_decode(stream_get_contents(STDIN), true); foreach ((array)$j as $r) if (($r["name"] ?? "") === "php" && ($r["status"] ?? "") === "failed" && preg_match("/([0-9]+\\\\.[0-9]+)/", $r["failed_requirement"]["constraint"] ?? "", $m)) { echo $m[1]; break; }' 2>/dev/null || true)
+    HAVE=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;' 2>/dev/null || true)
+    echo
+    echo "   You can fix this in one of two ways:"
+    echo "   1) On the server: install a PHP version the app supports (a button appears below this log)."
+    echo "   2) In your code: add  \\"config\\": { \\"platform\\": { \\"php\\": \\"\${HAVE:-8.3}.0\\" } }  to composer.json, run  composer update  on your computer"
+    echo "      and commit the new composer.lock, so the lock file only uses packages that work on this server's PHP."
+    echo "@@HINT php:\${NEED:-}"
+    exit 1
+  fi
+  echo "PHP $(php -r 'echo PHP_VERSION;') satisfies this app's requirements"
+else
+  echo "(no composer.lock: nothing to check)"
+fi
+`;
 
 const TOOL_COMMAND = { node: 'node', java: 'java', php: 'php', composer: 'composer', dotnet: 'dotnet', go: 'go', python: 'python3', git: 'git' };
 
@@ -186,9 +210,10 @@ printf %s ${shq(ctx.envFile)} > "$TMP/env"; printf %s ${shq(ctx.envShell)} > "$T
 put "$TMP/env" "$APP_DIR/shared/.env" 600
 put "$TMP/envsh" "$APP_DIR/shared/.env.sh" 600
 ln -sfn "$APP_DIR/shared/.env" "$REL/.env"
-if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv chown -R "$APP_USER": "$REL"; fi
 ${shared ? `\nstep "Linking shared folders"${shared}\n` : ''}
-${run('Installing dependencies', cfg.install)}${run('Building', cfg.build)}${cfg.mode === 'service' ? '' : `
+# from here on the app user owns the release (the SSH user must use sudo to touch it)
+if [ -n "$APP_USER" ] && [ "$APP_USER" != "$(id -un)" ]; then priv chown -R "$APP_USER": "$REL"; fi
+${cfg.phpCheck ? PHP_PREFLIGHT : ''}${run('Installing dependencies', cfg.install)}${run('Building', cfg.build)}${cfg.mode === 'service' ? '' : `
 OUTDIR=${shq(cfg.outputDir || 'auto')}
 if [ "$OUTDIR" = auto ]; then
   OUTDIR=$(cd "$REL" && find dist build out .output/public public -maxdepth 4 -name index.html -not -path '*/node_modules/*' 2>/dev/null | awk '{print length($0), $0}' | sort -n | head -1 | cut -d' ' -f2- | xargs -r dirname) || true
@@ -197,7 +222,7 @@ if [ "$OUTDIR" = auto ]; then
   OUTDIR=\${OUTDIR#./}
 fi
 [ -d "$REL/$OUTDIR" ] || { echo "!! The output folder '$OUTDIR' does not exist after the build."; exit 1; }
-echo "$OUTDIR" > "$REL/.outdir"
+echo "$OUTDIR" | priv tee "$REL/.outdir" >/dev/null
 echo "Serving the folder: $OUTDIR"
 `}${run('Running the release command (before going live)', cfg.releaseCmd)}${cfg.mode === 'service' ? `
 step "Configuring service $UNIT"
@@ -228,7 +253,7 @@ ${cfg.afterCmd ? `\nstep ${shq('Running the after-deploy command')}\nREL="$APP_D
 step "Cleaning old releases (keeping $KEEP)"
 cur=$(readlink "$APP_DIR/current")
 ls -1dt "$APP_DIR"/releases/*/ 2>/dev/null | sed 's#/$##' | tail -n +$((KEEP + 1)) | while read -r d; do
-  if [ "$d" != "$cur" ] && [ "$d" != "$PREV" ]; then rm -rf -- "$d"; echo "removed $(basename "$d")"; fi
+  if [ "$d" != "$cur" ] && [ "$d" != "$PREV" ]; then priv rm -rf -- "$d"; echo "removed $(basename "$d")"; fi
 done
 STATE=ok; echo "@@STATE ok"
 echo; echo "Deployed $SHA"
@@ -281,7 +306,7 @@ ${PRIV}
 ${app.unit ? `UNIT=${shq(app.unit)}
 priv systemctl stop "$UNIT" 2>/dev/null; priv systemctl disable "$UNIT" 2>/dev/null
 priv rm -f ${shq(ctx.unitDir + '/' + app.unit)}; priv systemctl daemon-reload` : 'true'}
-${ctx.deleteFiles ? `rm -rf -- ${shq(ctx.appDir)} 2>/dev/null || priv rm -rf -- ${shq(ctx.appDir)}` : 'true'}
+${ctx.deleteFiles ? `priv rm -rf -- ${shq(ctx.appDir)}` : 'true'}
 echo done
 `;
 }
@@ -298,6 +323,10 @@ cd "$TMP/src"
 echo "@@PRESET $(
 ${detectScript()}
 )"
+if [ -f composer.lock ] && command -v composer >/dev/null 2>&1 && command -v php >/dev/null 2>&1; then
+  echo "@@PHPCHECK $(COMPOSER_ALLOW_SUPERUSER=1 composer check-platform-reqs --lock --no-dev --format=json 2>/dev/null | tr -d '\\n' | head -c 6000)"
+fi
+echo "@@PHPHAVE $(php -r 'echo PHP_VERSION;' 2>/dev/null || true)"
 `;
 }
 
@@ -358,6 +387,7 @@ function installScript(tools, ctx) {
   const parts = [`set -euo pipefail
 USE_SUDO=${ctx.useSudo ? 1 : 0}
 ${PRIV}
+REPLACE_PHP=${ctx.replacePhp ? 1 : 0}
 TMPC=$(mktemp -d); trap 'rm -rf "$TMPC"' EXIT
 command -v dnf >/dev/null || { echo "dnf not found - this installer targets Amazon Linux 2023"; exit 1; }`];
   const want = (t) => tools.includes(t);
@@ -368,16 +398,46 @@ command -v dnf >/dev/null || { echo "dnf not found - this installer targets Amaz
   if (want('dotnet')) parts.push('step "Installing .NET SDK 8"; priv dnf -y install dotnet-sdk-8.0');
   if (want('go')) parts.push('step "Installing Go"; priv dnf -y install golang');
   if (want('python')) parts.push('step "Installing Python"; priv dnf -y install python3 python3-pip');
-  if (want('php')) {
-    parts.push(`step "Installing PHP 8.3 + PHP-FPM"
-priv dnf -y install php8.3 php8.3-fpm php8.3-cli php8.3-common php8.3-mbstring php8.3-xml php8.3-mysqlnd php8.3-pdo php8.3-gd php8.3-intl php8.3-bcmath php8.3-opcache php8.3-process unzip
+  for (const [tool, ver] of [['php82', '8.2'], ['php', '8.3'], ['php84', '8.4']]) {
+    if (!want(tool)) continue;
+    parts.push(`step "Installing PHP ${ver} + PHP-FPM"
+VER=${ver}
+CUR=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;' 2>/dev/null || true)
+if [ -n "$CUR" ] && [ "$CUR" != "$VER" ]; then
+  echo "PHP $CUR is installed. Amazon Linux 2023 keeps one PHP version at a time, so this replaces it."
+  # never remove anything unless the new version can actually be installed
+  priv dnf -q list --available "php$VER" >/dev/null 2>&1 || { echo "!! PHP $VER packages are not available in this server's repositories (try installing all system updates first, then retry). Nothing was changed."; exit 1; }
+  if [ "\${REPLACE_PHP:-0}" != 1 ]; then echo "!! Switching from PHP $CUR to $VER affects EVERY PHP site on this server. Confirm the switch in the panel and try again. Nothing was changed."; exit 1; fi
+  echo "Replacing PHP $CUR with PHP $VER (PHP-FPM restarts briefly)..."
+  priv systemctl stop php-fpm 2>/dev/null || true
+  priv dnf -y remove "php$CUR*"
+fi
+priv dnf -y install php$VER php$VER-fpm php$VER-cli php$VER-common php$VER-mbstring php$VER-xml php$VER-mysqlnd php$VER-pdo php$VER-gd php$VER-intl php$VER-bcmath php$VER-opcache php$VER-process unzip
 # nginx must be able to use the PHP-FPM socket
 if [ -f /etc/php-fpm.d/www.conf ]; then
   priv sed -i -E 's/^;?(user|group|listen\\.owner|listen\\.group) = .*/\\1 = nginx/' /etc/php-fpm.d/www.conf
   priv sed -i -E 's#^;?listen\\.mode = .*#listen.mode = 0660#' /etc/php-fpm.d/www.conf
 fi
-priv systemctl enable --now php-fpm
-echo "PHP-FPM runs as the nginx user and listens on /run/php-fpm/www.sock"`);
+priv systemctl enable php-fpm
+priv systemctl restart php-fpm
+echo "PHP $(php -r 'echo PHP_VERSION;') is ready; PHP-FPM runs as the nginx user and listens on /run/php-fpm/www.sock"`);
+  }
+  if (want('mariadb')) {
+    parts.push(`step "Installing MariaDB (local only)"
+priv dnf -y install mariadb1011-server mariadb1011 || priv dnf -y install mariadb105-server mariadb105
+printf '[mysqld]\\nbind-address=127.0.0.1\\n' > "$TMPC/panel.cnf"
+priv mkdir -p /etc/my.cnf.d; priv install -m 644 "$TMPC/panel.cnf" /etc/my.cnf.d/panel.cnf
+priv systemctl enable --now mariadb
+# basic hardening: no anonymous accounts, no test database
+priv mysql -e "DELETE FROM mysql.global_priv WHERE User=''; DROP DATABASE IF EXISTS test; FLUSH PRIVILEGES;" || true
+echo "MariaDB listens on 127.0.0.1 only; the panel manages it through root's local socket, so no admin password is stored anywhere."`);
+  }
+  if (want('postgresql')) {
+    parts.push(`step "Installing PostgreSQL (local only)"
+priv dnf -y install postgresql16-server postgresql16 || priv dnf -y install postgresql15-server postgresql15
+priv postgresql-setup --initdb || true
+priv systemctl enable --now postgresql
+echo "PostgreSQL listens on localhost only; the panel manages it as the postgres OS user, so no admin password is stored anywhere."`);
   }
   if (want('composer')) parts.push(`command -v php >/dev/null || { echo "Install PHP first"; exit 1; }\n${COMPOSER_INSTALL}`);
   if (want('nginx')) {

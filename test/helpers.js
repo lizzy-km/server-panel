@@ -48,6 +48,8 @@ async function startSshd({ authorizedKeys, env = {} }) {
   const hostKey = genKey(dir, 'host_ed25519');
   const port = 20000 + Math.floor(Math.random() * 20000);
   fs.writeFileSync(path.join(dir, 'authorized_keys'), authorizedKeys.join('\n') + '\n');
+  // sshd reads authorized_keys as the user who logs in, so non-root test users need to be able to read it
+  fs.chmodSync(dir, 0o755); fs.chmodSync(path.join(dir, 'authorized_keys'), 0o644);
   fs.writeFileSync(path.join(dir, 'sshd_config'), [
     `Port ${port}`, 'ListenAddress 127.0.0.1', `HostKey ${hostKey.file}`, `PidFile ${dir}/sshd.pid`,
     `AuthorizedKeysFile ${dir}/authorized_keys`, 'PermitRootLogin yes', 'PasswordAuthentication no', 'KbdInteractiveAuthentication no',
@@ -93,6 +95,7 @@ async function makeTarget() {
   const overrides = {
     appsBaseDir: dirs.apps, unitDir: dirs.units, nginxConfDir: dirs.conf, nginxLogDir: dirs.logs, nginxConf,
     letsencryptDir: dirs.le, acmeRoot: dirs.acme, allowLocalRepos: true, phpSocket: `unix:${dir}/php-fpm.sock`,
+    exportDir: path.join(dir, 'exports'), backupRoot: path.join(dir, 'backups'), backupScriptDir: path.join(dir, 'backup-scripts'),
   };
   return { dir, dirs, state, key, sshd, overrides, stop() { sshd.stop(); try { for (const f of fs.readdirSync(state)) if (f.endsWith('.pid')) { try { process.kill(Number(fs.readFileSync(path.join(state, f), 'utf8')), 'SIGKILL'); } catch { /* gone */ } } } catch { /* ignore */ } fs.rmSync(dir, { recursive: true, force: true }); } };
 }
@@ -106,9 +109,14 @@ module.exports.canTarget = () => canSshd() && process.getuid && process.getuid()
 
 const GLOBAL = /^\/api\/(session|setup|login|logout|account|users|audit|servers|alerts\/thresholds|hooks|jobs)/;
 
-async function makeStack() {
+async function makeStack(opts = {}) {
   const { createApp } = require('../server/index');
   const target = await makeTarget();
+  // optionally connect as a normal (non-root) user, like ec2-user: root hides every permission problem
+  if (opts.sshUser) {
+    fs.chmodSync(target.dir, 0o755);
+    require('child_process').execFileSync('chown', ['-R', opts.sshUser, target.dirs.apps]);
+  }
   const dataDir = tmp('stack-data-');
   const app = createApp({ dataDir, port: 0, host: '127.0.0.1', enableLocal: false, ...target.overrides });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
@@ -129,14 +137,16 @@ async function makeStack() {
     return { status: res.status, json, setCookie: res.headers.get('set-cookie'), raw: JSON.stringify(json) };
   };
 
+  try {
   const setup = await stack.call('POST', '/api/setup', { username: 'admin', password: 'longenoughpass', setupToken: app.auth.setupToken });
   stack.cookie = setup.setCookie.split(';')[0];
   const add = await stack.call('POST', '/api/servers', {
-    name: 'stack-server', host: '127.0.0.1', port: target.sshd.port, username: os.userInfo().username,
+    name: 'stack-server', host: '127.0.0.1', port: target.sshd.port, username: opts.sshUser || os.userInfo().username,
     privateKey: target.key.text, hostKey: target.sshd.hostKeyFp, fileRoot: target.dir,
   });
   if (add.status !== 200) throw new Error('could not add stack server: ' + add.raw);
   stack.serverId = add.json.server.id;
+  } catch (e) { app.servers.closeAll(); app.server.close(); target.stop(); throw e; }
 
   stack.loginViewer = async () => {
     await stack.call('POST', '/api/users', { username: 'viewer1', password: 'viewerpassword1', role: 'viewer' });

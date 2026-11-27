@@ -18,7 +18,7 @@ const PRESETS = [
   {
     id: 'laravel', label: 'Laravel / PHP', group: 'PHP', mode: 'php', icon: '🐘', tools: ['php', 'composer'],
     description: 'Composer install, optional asset build, database migrations, shared storage, PHP-FPM reload.',
-    detect: '[ -f artisan ] && [ -f composer.json ]',
+    detect: '[ -f artisan ] && [ -f composer.json ]', phpCheck: true,
     install: 'composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist',
     // one statement per line on purpose: a failure inside an `A && B` chain would NOT stop the deploy under `set -e`
     build: `if [ -f package.json ] && command -v npm >/dev/null; then
@@ -37,7 +37,7 @@ php artisan view:cache`,
   {
     id: 'php', label: 'PHP (plain / WordPress / other)', group: 'PHP', mode: 'php', icon: '🐘', tools: ['php'],
     description: 'PHP files served through PHP-FPM; optional Composer install.',
-    detect: '[ -f index.php ] || [ -f composer.json ]',
+    detect: '[ -f index.php ] || [ -f composer.json ]', phpCheck: true,
     install: 'if [ -f composer.json ]; then composer install --no-dev --optimize-autoloader --no-interaction; else echo "(no composer.json)"; fi',
     build: '', releaseCmd: '', afterCmd: '', outputDir: '.', sharedPaths: [], healthPath: '/', spa: false,
   },
@@ -131,6 +131,7 @@ function resolve(app) {
     healthPath: own('healthPath') ?? p.healthPath ?? '/',
     healthTimeout: own('healthTimeout') ?? p.healthTimeout ?? 30,
     spa: app.spa !== undefined ? !!app.spa : !!p.spa,
+    phpCheck: !!p.phpCheck,
   };
 }
 

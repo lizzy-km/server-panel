@@ -330,6 +330,7 @@ class DeployManager {
     if (r.code !== 0 && status === 'success') status = 'failed';
     if (r.markers.COMMIT && r.markers.COMMIT !== 'unknown') rec.commit = r.markers.COMMIT;
     if (r.markers.MSG) rec.message = r.markers.MSG;
+    if (r.markers.HINT) rec.hint = String(r.markers.HINT).slice(0, 40);
     if (status === 'success') {
       // The new port is live now: repoint nginx sites BEFORE reporting success, so "success" means everything is consistent.
       const app = this.apps.find((a) => a.id === rec.appId);
@@ -507,9 +508,9 @@ echo "indexOk=$([ -f ${shq(dir + '/live/index.html')} ] || [ -f ${shq(dir + '/li
     };
   }
 
-  static get INSTALLABLE() { return ['git', 'node', 'java', 'maven', 'dotnet', 'go', 'python', 'php', 'composer', 'nginx', 'certbot']; }
+  static get INSTALLABLE() { return ['git', 'node', 'java', 'maven', 'dotnet', 'go', 'python', 'php', 'php82', 'php84', 'composer', 'nginx', 'certbot', 'mariadb', 'postgresql']; }
 
-  async install(serverId, tools, user) {
+  async install(serverId, tools, user, { replacePhp = false } = {}) {
     const allowed = DeployManager.INSTALLABLE;
     if (!Array.isArray(tools) || !tools.length || !tools.every((t) => allowed.includes(t))) throw httpError(400, `tools must be a non-empty subset of ${allowed.join(', ')}`);
     const e = this.servers.entry(serverId);
@@ -517,7 +518,7 @@ echo "indexOk=$([ -f ${shq(dir + '/live/index.html')} ] || [ -f ${shq(dir + '/li
     const id = crypto.randomUUID();
     // composer needs PHP, and PHP-FPM needs nginx's user: keep a sensible order
     const order = allowed.filter((t) => tools.includes(t));
-    const script = S.installScript(order, { useSudo: e.host.useSudo, acmeRoot: this.config.acmeRoot, unitDir: this.config.unitDir });
+    const script = S.installScript(order, { useSudo: e.host.useSudo, acmeRoot: this.config.acmeRoot, unitDir: this.config.unitDir, replacePhp: !!replacePhp });
     this.runner.run({ id, host: e.host, script, timeout: 30 * 60 * 1000 }).catch(() => {});
     return { id, user };
   }
@@ -536,7 +537,21 @@ echo "indexOk=$([ -f ${shq(dir + '/live/index.html')} ] || [ -f ${shq(dir + '/li
     if (err) throw httpError(400, `Could not read the repository: ${err}`);
     const id = (r.stdout.match(/@@PRESET (\S+)/) || [])[1];
     if (!id || !P.BY_ID[id]) throw httpError(500, 'Detection failed: ' + (r.stderr || r.stdout).slice(-200));
-    return { preset: id, label: P.BY_ID[id].label, mode: P.BY_ID[id].mode };
+    const out = { preset: id, label: P.BY_ID[id].label, mode: P.BY_ID[id].mode };
+    const have = (r.stdout.match(/@@PHPHAVE (\S+)/) || [])[1];
+    if (P.BY_ID[id].phpCheck) {
+      out.php = { installed: have || null, problems: [], needs: null };
+      try {
+        const j = JSON.parse((r.stdout.match(/@@PHPCHECK (.*)/) || [])[1] || '[]');
+        for (const x of Array.isArray(j) ? j : []) {
+          if (x.status !== 'failed' && x.status !== 'missing') continue;
+          const c = x.failed_requirement && x.failed_requirement.constraint || '';
+          if (x.name === 'php') { out.php.needs = (c.match(/(\d+\.\d+)/) || [])[1] || null; out.php.problems.push(`PHP ${c} is required but this server has PHP ${x.version || have || '?'}`); }
+          else out.php.problems.push(`The PHP extension ${String(x.name).replace(/^ext-/, '')} is required but is not installed`);
+        }
+      } catch { /* an unreadable check is not a problem report */ }
+    }
+    return out;
   }
 }
 

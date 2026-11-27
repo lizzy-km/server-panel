@@ -13,10 +13,22 @@ const pkg = require('./lib/pkg');
 const { DeployManager } = require('./lib/deploy');
 const { DomainManager } = require('./lib/domains');
 const { LaravelManager } = require('./lib/laravel');
+const { DatabaseManager } = require('./lib/databases');
 const { summarizeFile } = require('./lib/nginxparse');
 const { readBody } = require('./lib/http');
 
 const COOKIE = 'panel_session';
+
+/** Set or add KEY=value lines in .env text without touching anything else (comments, order, other keys). */
+function mergeEnvText(text, vars) {
+  let out = String(text);
+  for (const [k, v] of Object.entries(vars)) {
+    const line = `${k}=${/[\s"'#\\]/.test(v) ? `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : v}`;
+    const re = new RegExp(`^${k}=.*$`, 'm');
+    out = re.test(out) ? out.replace(re, () => line) : out.replace(/\n*$/, '\n') + line + '\n';
+  }
+  return out;
+}
 
 function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
@@ -30,6 +42,7 @@ function createApp(overrides = {}) {
   const deploy = new DeployManager({ store, vault, servers, config });
   const domains = new DomainManager({ store, servers, deploy, config });
   const laravel = new LaravelManager({ store, servers, config });
+  const databases = new DatabaseManager({ servers, config });
   // an app's port changed and a deploy has made the new port live: repoint nginx sites that proxy to it
   deploy.onPortChanged = async (app) => {
     for (const site of domains.sites.filter((x) => x.serverId === app.serverId && x.upstream.type === 'app' && x.upstream.appId === app.id)) {
@@ -305,7 +318,7 @@ function createApp(overrides = {}) {
   scoped('GET', '/api/provision/status', 'user', async (ctx) => deploy.toolsStatus(ctx.srv.host));
   scoped('POST', '/api/provision/install', 'admin', async (ctx) => {
     const b = await readJson(ctx.req);
-    const r = await deploy.install(ctx.srv.id, b.tools, ctx.user.username);
+    const r = await deploy.install(ctx.srv.id, b.tools, ctx.user.username, { replacePhp: b.replacePhp === true });
     note(ctx, 'provision_install', (b.tools || []).join(' '));
     return r;
   });
@@ -532,6 +545,81 @@ function createApp(overrides = {}) {
     return r;
   });
 
+  // --- databases (MariaDB / MySQL / PostgreSQL), admin only ---
+  scoped('GET', '/api/db/status', 'admin', async (ctx) => databases.status(ctx.srv.id));
+  scoped('GET', '/api/db/overview', 'admin', async (ctx) => databases.overview(ctx.srv.id, q(ctx, 'engine')));
+  scoped('POST', '/api/db/databases', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await databases.createDatabase(ctx.srv.id, b);
+    note(ctx, 'db_create', `${b.engine}: ${r.name}${r.user ? ` (+ user ${r.user})` : ''}`);
+    return r;
+  });
+  scoped('DELETE', '/api/db/databases', 'admin', async (ctx) => {
+    const r = await databases.dropDatabase(ctx.srv.id, { engine: q(ctx, 'engine'), name: q(ctx, 'name'), confirm: q(ctx, 'confirm') });
+    note(ctx, 'db_drop', `${q(ctx, 'engine')}: ${q(ctx, 'name')}`);
+    return r;
+  });
+  scoped('POST', '/api/db/users', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await databases.createUser(ctx.srv.id, b);
+    note(ctx, 'db_user_create', `${b.engine}: ${r.name}${b.database ? ` on ${b.database}` : ''}`);
+    return r;
+  });
+  scoped('POST', '/api/db/users/password', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await databases.resetPassword(ctx.srv.id, b);
+    note(ctx, 'db_user_password', `${b.engine}: ${r.name}`);
+    return r;
+  });
+  scoped('POST', '/api/db/grant', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await databases.grant(ctx.srv.id, b);
+    note(ctx, 'db_' + b.action, `${b.engine}: ${b.user} on ${b.database}`);
+    return r;
+  });
+  scoped('DELETE', '/api/db/users', 'admin', async (ctx) => {
+    const r = await databases.dropUser(ctx.srv.id, { engine: q(ctx, 'engine'), name: q(ctx, 'name'), confirm: q(ctx, 'confirm') });
+    note(ctx, 'db_user_drop', `${q(ctx, 'engine')}: ${q(ctx, 'name')}`);
+    return r;
+  });
+  scoped('POST', '/api/db/export', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await databases.exportDatabase(ctx.srv.id, b);
+    note(ctx, 'db_export', `${b.engine}: ${b.name} (${r.bytes} bytes)`);
+    return r;
+  });
+  scoped('GET', '/api/db/download', 'admin', async (ctx) => {
+    const d = await databases.exportStream(ctx.srv.id, q(ctx, 'file'));
+    note(ctx, 'db_download', d.name);
+    ctx.res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Length': d.size, 'Content-Disposition': `attachment; filename="${d.name}"` });
+    d.stream.on('error', () => ctx.res.destroy());
+    d.stream.pipe(ctx.res);
+    return undefined;
+  });
+  scoped('POST', '/api/db/import', 'admin', async (ctx) => {
+    const r = await databases.importDatabase(ctx.srv.id, { engine: q(ctx, 'engine'), name: q(ctx, 'name'), confirm: q(ctx, 'confirm'), filename: q(ctx, 'filename'), req: ctx.req, limit: config.maxUploadBytes });
+    note(ctx, 'db_import', `${q(ctx, 'engine')}: ${q(ctx, 'name')} <- ${q(ctx, 'filename')}${r.safetyDump ? ` (previous contents saved as ${r.safetyDump})` : ''}`);
+    return r;
+  });
+  // write the connection settings into an app's environment so nobody has to copy a password around
+  scoped('POST', '/api/db/use-in-app', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    if (!['mysql', 'postgres'].includes(b.engine)) throw httpError(400, 'engine must be mysql or postgres');
+    const vars = DatabaseManager.connectionEnv(b.engine, { database: String(b.database || ''), user: String(b.user || ''), password: String(b.password || '') });
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(vars.DB_DATABASE) || !/^[A-Za-z][A-Za-z0-9_]{0,31}$/.test(vars.DB_USERNAME) || !vars.DB_PASSWORD) throw httpError(400, 'database, user and password are required');
+    if (b.target && b.target.type === 'laravel') {
+      const app = lvOf(ctx, b.target.id);
+      const cur = (await laravel.readEnv(app)).content;
+      const r = await laravel.writeEnv(app, mergeEnvText(cur, vars), { apply: !!b.apply });
+      note(ctx, 'db_use_in_app', `${b.engine}:${vars.DB_DATABASE} -> ${app.name} .env`);
+      return { ok: true, target: app.name, applied: r.applied };
+    }
+    const app = appOf(ctx, b.target && b.target.id);
+    deploy.setEnv(app.id, vars);
+    note(ctx, 'db_use_in_app', `${b.engine}:${vars.DB_DATABASE} -> ${app.name}`);
+    return { ok: true, target: app.name, redeploy: true };
+  });
+
   // --- users & audit ---
   route('GET', '/api/users', 'admin', async () => ({ users: auth.users.map((u) => auth.publicUser(u)) }));
   route('POST', '/api/users', 'admin', async (ctx) => {
@@ -609,7 +697,7 @@ function createApp(overrides = {}) {
 
   const server = http.createServer((req, res) => { handle(req, res); });
   server.requestTimeout = 0; // allow long uploads; body size is limited separately
-  return { server, config, auth, store, audit, servers, vault, deploy, domains, laravel };
+  return { server, config, auth, store, audit, servers, vault, deploy, domains, laravel, databases };
 }
 
 function main() {
@@ -635,4 +723,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { createApp, main };
+module.exports = { createApp, main, mergeEnvText };

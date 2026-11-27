@@ -65,7 +65,7 @@ test('presets: every framework produces valid scripts in every mode', () => {
   const all = S.installScript(P.PRESETS.flatMap((p) => p.tools).concat(['maven', 'nginx', 'certbot', 'git']), { useSudo: true, acmeRoot: '/var/www/letsencrypt', unitDir: '/etc/systemd/system' });
   fs.writeFileSync(path.join(dir, 'i.sh'), all);
   assert.equal(spawnSync('bash', ['-n', path.join(dir, 'i.sh')]).status, 0);
-  for (const needle of ['dotnet-sdk-8.0', 'java-21-amazon-corretto-devel', 'php8.3-fpm', 'installer.sig', 'golang', 'python3-pip']) assert.ok(all.includes(needle), needle);
+  for (const needle of ['dotnet-sdk-8.0', 'java-21-amazon-corretto-devel', 'VER=8.3', 'php$VER-fpm', 'installer.sig', 'golang', 'python3-pip']) assert.ok(all.includes(needle), needle);
   fs.writeFileSync(path.join(dir, 't.sh'), S.TOOLS_CHECK);
   assert.equal(spawnSync('bash', ['-n', path.join(dir, 't.sh')]).status, 0);
 });

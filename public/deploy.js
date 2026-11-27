@@ -49,6 +49,23 @@ function kv(rows) {
   return h('div', { class: 'kv' }, rows.filter(Boolean).flatMap(([k, v]) => [h('div', { class: 'k' }, k), h('div', { class: 'v' }, v)]));
 }
 
+/** Offer to switch the server's PHP version (never silently: it affects every PHP site on the server). */
+function phpSwitchBox(needs, installed, onStarted) {
+  const ver = needs && /^8\.[2-4]$/.test(needs) ? needs : '8.4';
+  const tool = { '8.2': 'php82', '8.3': 'php', '8.4': 'php84' }[ver];
+  const btn = h('button', { type: 'button', class: 'primary' }, `Install PHP ${ver} on this server`);
+  btn.onclick = async () => {
+    if (!window.confirm(`Switch this server from PHP ${installed || 'current'} to PHP ${ver}?\n\nAmazon Linux keeps one PHP version at a time, so EVERY PHP site on this server will run on PHP ${ver} afterwards (PHP-FPM restarts briefly). The panel checks that PHP ${ver} is available first and changes nothing if it is not.`)) return;
+    try {
+      const r = await api('/api/provision/install', { method: 'POST', body: { tools: [tool], replacePhp: true } });
+      logModal(`Installing PHP ${ver}`, { url: `/api/jobs/log?id=${r.id}`, onDone: onStarted });
+    } catch (e) { fail(e); }
+  };
+  return h('div', { class: 'card', style: { margin: '8px 0', padding: '10px' } },
+    h('div', { style: { marginBottom: '6px' } }, `This app needs PHP ${ver} or newer, but this server has PHP ${installed || 'an older version'}.`),
+    btn, h('div', { class: 'muted', style: { fontSize: '12.5px', marginTop: '6px' } }, 'Alternative: in your code add "config": { "platform": { "php": "8.3.0" } } to composer.json, run composer update, and commit composer.lock.'));
+}
+
 /** Live log viewer for a deploy (id) or a provisioning job; polls until finished. */
 function logModal(title, { url, onDone }) {
   const pre = h('pre', { class: 'out', style: { minHeight: '40vh' } }, '');
@@ -63,6 +80,7 @@ function logModal(title, { url, onDone }) {
         if (r.text) { pre.textContent += r.text; if (followed) pre.scrollTop = pre.scrollHeight; }
         offset = r.offset;
         if (r.deploy) badge.replaceChildren(deployBadge(r.deploy.status));
+        if (r.deploy && r.deploy.hint && r.deploy.hint.startsWith('php:') && r.deploy.status === 'failed' && !badge.dataset.hint) { badge.dataset.hint = '1'; badge.parentNode.appendChild(phpSwitchBox(r.deploy.hint.slice(4), '', () => {})); }
         if (r.done && (!r.deploy || r.deploy.status !== 'running')) {
           if (!r.deploy) badge.replaceChildren(h('span', { class: 'badge ok' }, 'finished'));
           if (onDone) onDone(r.deploy || null);
@@ -230,6 +248,7 @@ function appForm(app, apps, presets, tools) {
 
   // ---- detection
   const detectBtn = h('button', { type: 'button' }, 'Detect framework from the repository');
+  const detectBox = h('div', {});
   const detectMsg = h('span', { class: 'muted', style: { marginLeft: '10px', fontSize: '12.5px' } });
   detectBtn.onclick = act(detectBtn, async () => {
     detectMsg.textContent = 'Looking inside the repository…';
@@ -238,6 +257,8 @@ function appForm(app, apps, presets, tools) {
       if (body.authType !== 'none') body.gitSecret = f.secret.value.trim();
       const r = await api('/api/apps/detect', { method: 'POST', body });
       framework = r.preset; refresh(); detectMsg.textContent = `Detected: ${r.label}`;
+      detectBox.replaceChildren();
+      if (r.php && r.php.problems.length) detectBox.append(h('div', { class: 'err' }, r.php.problems.join('. ')), phpSwitchBox(r.php.needs, r.php.installed, () => {}));
     } catch (e) { detectMsg.textContent = ''; fail(e); }
   });
 
@@ -246,7 +267,7 @@ function appForm(app, apps, presets, tools) {
     field('Release command (runs before going live; a failure cancels the deploy)', f.releaseCmd), field('After-deploy command (runs once live)', f.afterCmd));
   const el = h('div', {},
     isNew ? h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox,
-      h('div', { class: 'row', style: { margin: '0 0 10px' } }, detectBtn, detectMsg)) : h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox),
+      h('div', { class: 'row', style: { margin: '0 0 10px' } }, detectBtn, detectMsg), detectBox) : h('div', {}, field('Git repository', f.repoUrl), h('div', { class: 'grid2' }, field('Branch or tag', f.branch), field('Access', f.authType)), secretBox),
     h('div', { class: 'field' }, h('label', {}, isNew ? 'Framework' : 'Framework (fixed after creation)'), picker), info, isNew ? req : '',
     modeFields,
     isNew ? h('div', { class: 'grid2' }, field('App name', f.name, 'Lowercase letters, digits, dashes'), h('div', {})) : '',
