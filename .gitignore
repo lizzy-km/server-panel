@@ -1,4 +1,6 @@
-node_modules/
+# Dependencies are vendored (see README) so the panel runs with no `npm install`.
+# Only npm's own hidden cache file is ignored.
+node_modules/.package-lock.json
 data/
 *.log
 .env

@@ -40,12 +40,12 @@ APP=/opt/server-panel
 DATA=/var/lib/server-panel
 ENVFILE=/etc/server-panel.env
 
-echo "==> Installing Node.js and npm"
-if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ] || ! command -v npm >/dev/null 2>&1; then
-  dnf install -y nodejs22 nodejs22-npm || dnf install -y nodejs20 nodejs20-npm
+echo "==> Installing Node.js"
+if ! command -v node >/dev/null 2>&1 || [ "$(node -p 'process.versions.node.split(".")[0]')" -lt 20 ]; then
+  dnf install -y nodejs22 || dnf install -y nodejs20
 fi
 NODE_BIN="$(command -v node)"
-echo "    using $NODE_BIN ($(node -v)), npm $(npm -v)"
+echo "    using $NODE_BIN ($(node -v))"
 
 echo "==> Creating service user"
 id panel >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell /sbin/nologin panel
@@ -53,8 +53,9 @@ install -d -o panel -g panel -m 0700 "$DATA"
 
 echo "==> Copying application to $APP"
 install -d -m 0755 "$APP"
-cp -a "$SRC/server" "$SRC/public" "$SRC/package.json" "$SRC/package-lock.json" "$APP/"
-( cd "$APP" && npm ci --omit=dev --omit=optional --no-audit --no-fund --loglevel=error )
+# Dependencies are vendored in node_modules/ (no npm, no network access needed)
+cp -a "$SRC/server" "$SRC/public" "$SRC/node_modules" "$SRC/package.json" "$APP/"
+[ -d "$APP/node_modules/ssh2" ] || { echo "node_modules/ssh2 missing from the checkout" >&2; exit 1; }
 chown -R root:root "$APP"
 
 if [ ! -f "$ENVFILE" ]; then

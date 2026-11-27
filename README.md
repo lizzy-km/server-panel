@@ -4,7 +4,7 @@ A self-hosted control panel that manages **Amazon Linux 2023** (EC2) servers **o
 the SSH key (`.pem` or PuTTY `.ppk`); it connects and gives you monitoring, services, updates, Docker, files, logs, cron
 and a terminal for that machine. Add as many servers as you like and switch between them.
 
-Node ≥ 20, one runtime dependency (`ssh2`, pure JavaScript, 5 small packages), vanilla-JS frontend, no build step.
+Node ≥ 20, vanilla-JS frontend, no build step. The one runtime dependency (`ssh2` and its 4 small pure-JavaScript dependencies, 2 MB) is **vendored in `node_modules/`**, so there is nothing to install: clone and run.
 
 | Area | What you get (per server) |
 |---|---|
@@ -24,8 +24,7 @@ Node ≥ 20, one runtime dependency (`ssh2`, pure JavaScript, 5 small packages),
 ## Quick start
 
 ```bash
-npm install --omit=optional
-node server/index.js          # prints a one-time setup token
+node server/index.js          # prints a one-time setup token — no `npm install` needed
 ```
 
 Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
@@ -71,7 +70,7 @@ git clone https://github.com/lizzy-km/server-panel && cd server-panel
 sudo ./deploy/install-al2023.sh
 ```
 
-The installer installs Node.js + npm, creates an unprivileged `panel` user, installs the app to `/opt/server-panel`, stores data in
+The installer installs Node.js, creates an unprivileged `panel` user, installs the app to `/opt/server-panel`, stores data in
 `/var/lib/server-panel`, generates a `PANEL_SECRET` in `/etc/server-panel.env`, installs a systemd unit and prints the setup token.
 Re-run it to upgrade; users, servers and the audit log are preserved. Put the panel in the same VPC as the servers it manages and use
 their private IPs where you can.
@@ -82,6 +81,16 @@ port-forward), or put it behind an ALB / nginx / Caddy with TLS and set `PANEL_S
 `--manage-local` additionally lets the panel manage **the machine it runs on** (sets `PANEL_ENABLE_LOCAL=true` and installs narrow
 sudoers rules for `systemctl`, `journalctl` and `dnf`); `--with-cron` / `--with-docker` set those up there. It is off by default because the
 panel is meant to manage remote servers.
+
+## Vendored dependencies
+
+`node_modules/` is committed on purpose (so installs work on networks that block npm and the exact audited versions are what runs):
+`ssh2` 1.17.0, `asn1` 0.2.6, `bcrypt-pbkdf` 1.0.2, `safer-buffer` 2.1.2, `tweetnacl` 0.14.5 — licenses are in each package folder
+(MIT / BSD-3-Clause / Unlicense). To update: `npm install ssh2@<version> --omit=optional --ignore-scripts`, then delete what must not be committed —
+`rm -rf node_modules/ssh2/test node_modules/ssh2/examples node_modules/ssh2/util node_modules/ssh2/lib/protocol/crypto/build node_modules/.package-lock.json`
+(ssh2's test fixtures contain sample private keys that GitHub's secret scanning blocks; `util/` holds a Pageant test `.exe` this panel never uses; the rest is build leftovers) — run `npm test`
+(`test/vendor.test.js` fails if key material, binaries or version drift sneak in) and commit. ssh2 runs on its pure-JavaScript crypto; no native build is used or needed.
+`.gitattributes` keeps these files byte-identical on Windows (no line-ending conversion).
 
 ## Configuration (environment variables)
 
