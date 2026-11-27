@@ -21,6 +21,16 @@ function loadConfig(env = process.env) {
     sampleIntervalMs: Number(env.PANEL_SAMPLE_MS || 3000),
     historyLength: Number(env.PANEL_HISTORY || 200),
     maxUploadBytes: Number(env.PANEL_MAX_UPLOAD_MB || 200) * 1024 * 1024,
+    // where things live on the MANAGED servers (defaults suit Amazon Linux 2023; overridable mainly for tests)
+    appsBaseDir: env.PANEL_APPS_DIR || '/srv/apps',
+    unitDir: env.PANEL_UNIT_DIR || '/etc/systemd/system',
+    nginxConfDir: env.PANEL_NGINX_CONF_DIR || '/etc/nginx/conf.d',
+    nginxLogDir: env.PANEL_NGINX_LOG_DIR || '/var/log/nginx',
+    nginxConf: env.PANEL_NGINX_CONF || '', // pass `-c <file>` to nginx (tests)
+    letsencryptDir: env.PANEL_LETSENCRYPT_DIR || '/etc/letsencrypt',
+    acmeRoot: env.PANEL_ACME_ROOT || '/var/www/letsencrypt',
+    allowLocalRepos: bool(env.PANEL_ALLOW_LOCAL_REPOS, false), // file:// repositories (tests only)
+    publicUrl: (env.PANEL_PUBLIC_URL || '').replace(/\/+$/, ''), // used to display webhook URLs
     publicDir: path.join(__dirname, '..', 'public'),
   };
 }

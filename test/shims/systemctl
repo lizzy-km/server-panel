@@ -1,0 +1,38 @@
+#!/bin/bash
+STATE="${SHIM_STATE:?}"; UNIT_DIR="${SHIM_UNIT_DIR:?}"
+cmd="$1"; shift
+quiet=0; args=()
+for a in "$@"; do case "$a" in --quiet|-q) quiet=1;; --no-pager|--no-legend|--plain) ;; *) args+=("$a");; esac; done
+unit="${args[${#args[@]}-1]}"
+active() { [ -f "$STATE/$1.pid" ] && kill -0 "$(cat "$STATE/$1.pid")" 2>/dev/null; }
+# like systemd (KillMode=control-group): signal the whole process group, not just the top process
+stop_unit() { if [ -f "$STATE/$1.pid" ]; then p=$(cat "$STATE/$1.pid"); kill -TERM -- "-$p" 2>/dev/null || kill "$p" 2>/dev/null; sleep 0.3; kill -KILL -- "-$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; rm -f "$STATE/$1.pid"; fi; }
+case "$cmd" in
+  daemon-reload|enable|disable|reset-failed) exit 0;;
+  is-enabled) echo enabled;;
+  is-active)
+    if [ "$unit" = nginx ] || [ "$unit" = certbot-renew.timer ]; then
+      if [ -f "$STATE/$unit.active" ]; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi
+    fi
+    if active "$unit"; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi;;
+  show)
+    case " ${args[*]} " in
+      *MainPID*) cat "$STATE/$unit.pid" 2>/dev/null || echo 0;;
+      *ActiveEnterTimestamp*) date;;
+      *MemoryCurrent*) echo 12345678;;
+      *NRestarts*) echo 0;;
+    esac;;
+  stop) stop_unit "$unit"; rm -f "$STATE/$unit.active";;
+  reload)
+    if [ "$unit" = nginx ]; then echo x >> "$STATE/nginx.reloads"; [ -f "$STATE/nginx.active" ] || exit 1; exit 0; fi; exit 0;;
+  start|restart)
+    if [ "$unit" = nginx ] || [ "$unit" = certbot-renew.timer ]; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi
+    f="$UNIT_DIR/$unit"; [ -f "$f" ] || { echo "Unit $unit not found." >&2; exit 5; }
+    stop_unit "$unit"
+    wd=$(sed -n 's/^WorkingDirectory=//p' "$f"); envf=$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$f"); ex=$(sed -n 's/^ExecStart=//p' "$f")
+    envs=$(sed -n 's/^Environment=//p' "$f" | tr '\n' ' ')
+    setsid nohup bash -c 'cd "$1" || exit 1; for kv in $2; do export "$kv"; done; set -a; [ -f "$3" ] && . "$3"; set +a; exec "$4"' _ "$wd" "$envs" "$envf" "$ex" >"$STATE/$unit.log" 2>&1 < /dev/null &
+    echo $! > "$STATE/$unit.pid";;
+  list-units|list-unit-files) ;;
+  *) echo "shim: unsupported systemctl $cmd" >&2; exit 1;;
+esac

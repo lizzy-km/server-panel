@@ -110,6 +110,22 @@ class LocalHost extends BaseHost {
     });
   }
 
+  /** Long-running command with live output (deploys, installs). stdin may carry a script for `bash -s`. */
+  stream(command, { stdin, timeout = 30 * 60 * 1000, onData } = {}) {
+    return new Promise((resolve) => {
+      const p = spawn('sh', ['-c', command], { env: { ...process.env, LC_ALL: 'C' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; p.kill('SIGKILL'); }, timeout);
+      p.stdout.setEncoding('utf8'); p.stderr.setEncoding('utf8');
+      p.stdout.on('data', (d) => onData && onData(d));
+      p.stderr.on('data', (d) => onData && onData(d));
+      p.stdin.on('error', () => {});
+      p.stdin.end(stdin !== undefined ? stdin : undefined);
+      p.on('error', (e) => { clearTimeout(timer); resolve({ code: null, signal: null, timedOut: false, error: e.message }); });
+      p.on('close', (code, signal) => { clearTimeout(timer); resolve({ code, signal, timedOut }); });
+    });
+  }
+
   runShell(command, { timeoutMs = 30000, cwd } = {}) {
     const limit = Math.min(Math.max(Number(timeoutMs) || 30000, 1000), 120000);
     return new Promise((resolve) => {
@@ -246,6 +262,26 @@ class SshHost extends BaseHost {
   }
 
   run(cmd, args = [], opts = {}) { return this.exec(buildCommand(cmd, args), opts); }
+
+  /** Long-running command with live output (deploys, installs). stdin may carry a script for `bash -s`. */
+  stream(command, { stdin, timeout = 30 * 60 * 1000, onData } = {}) {
+    return this.slot(async () => {
+      const conn = await this.connect();
+      return new Promise((resolve) => {
+        conn.exec(command, (err, stream) => {
+          if (err) { resolve({ code: null, signal: null, timedOut: false, error: err.message }); return; }
+          let timedOut = false;
+          const timer = setTimeout(() => { timedOut = true; try { stream.close(); } catch { /* ignore */ } }, timeout);
+          stream.setEncoding('utf8'); stream.stderr.setEncoding('utf8');
+          stream.on('data', (d) => onData && onData(d));
+          stream.stderr.on('data', (d) => onData && onData(d));
+          stream.on('error', () => {});
+          stream.on('close', (code, signal) => { clearTimeout(timer); resolve({ code: typeof code === 'number' ? code : null, signal: signal || null, timedOut }); });
+          if (stdin !== undefined) stream.end(stdin); else stream.end();
+        });
+      });
+    });
+  }
 
   async runShell(command, { timeoutMs = 30000, cwd } = {}) {
     const limit = Math.min(Math.max(Number(timeoutMs) || 30000, 1000), 120000);

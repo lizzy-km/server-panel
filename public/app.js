@@ -218,6 +218,8 @@ const NAV = [
   { id: 'processes', label: 'Processes', icon: '⚙', page: () => pageProcesses() },
   { id: 'services', label: 'Services', icon: '⏻', page: () => pageServices() },
   { id: 'packages', label: 'Updates', icon: '⬆', page: () => pagePackages() },
+  { id: 'deploy', label: 'Deploy', icon: '⇪', page: () => pageDeploy() },
+  { id: 'domains', label: 'Domains', icon: '⌂', page: () => pageDomains() },
   { id: 'docker', label: 'Docker', icon: '▣', page: () => pageDocker() },
   { id: 'network', label: 'Network', icon: '⇄', page: () => pageNetwork() },
   { sep: true, admin: true },
@@ -232,6 +234,7 @@ const NAV = [
 ];
 
 function currentRoute() { return (location.hash.replace(/^#\/?/, '') || 'dashboard'); }
+const routeArgs = () => currentRoute().split('/').slice(1);
 
 function render() {
   cleanups.forEach((f) => f()); cleanups = [];
@@ -242,7 +245,7 @@ function render() {
 
   const isAdmin = state.user.role === 'admin';
   const items = NAV.filter((n) => isAdmin || !n.admin);
-  const id = currentRoute();
+  const id = currentRoute().split('/')[0];
   const item = items.find((n) => n.id === id) || items[0];
   const content = h('div', {});
   const picker = h('select', { class: 'server-select', 'aria-label': 'Server', onchange: (e) => selectServer(e.target.value) },

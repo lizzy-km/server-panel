@@ -10,18 +10,30 @@ const { sendJson, readJson, parseCookies, serveStatic, applyHeaders } = require(
 const sys = require('./lib/sys');
 const ops = require('./lib/ops');
 const pkg = require('./lib/pkg');
+const { DeployManager } = require('./lib/deploy');
+const { DomainManager } = require('./lib/domains');
+const { readBody } = require('./lib/http');
 
 const COOKIE = 'panel_session';
 
 function createApp(overrides = {}) {
   const config = { ...loadConfig(), ...overrides };
   const store = new JsonStore(path.join(config.dataDir, 'panel.json'), {
-    users: [], sessions: {}, servers: [], settings: { alerts: { cpu: 90, mem: 90, disk: 90 } },
+    users: [], sessions: {}, servers: [], apps: [], sites: [], deploys: [], settings: { alerts: { cpu: 90, mem: 90, disk: 90 } },
   });
   const audit = new AuditLog(path.join(config.dataDir, 'audit.log'));
   const auth = new Auth(store, { sessionHours: config.sessionHours });
   const vault = new Vault(config.dataDir, config.secret);
   const servers = new ServerRegistry({ store, vault, config });
+  const deploy = new DeployManager({ store, vault, servers, config });
+  const domains = new DomainManager({ store, servers, deploy, config });
+  // an app's port changed and a deploy has made the new port live: repoint nginx sites that proxy to it
+  deploy.onPortChanged = async (app) => {
+    for (const site of domains.sites.filter((x) => x.serverId === app.serverId && x.upstream.type === 'app' && x.upstream.appId === app.id)) {
+      await domains.apply(site);
+      audit.write({ user: 'system', action: 'site_apply', detail: `${site.domain} repointed to port ${app.port}`, server: servers.entry(app.serverId).host.name });
+    }
+  };
   auth.ensureSetupToken();
 
   // ---- route table ----
@@ -114,6 +126,7 @@ function createApp(overrides = {}) {
     const id = q(ctx, 'id');
     const rec = servers.records.find((r) => r.id === id);
     servers.remove(id);
+    deploy.forgetServer(id);
     note(ctx, 'server_remove', rec ? rec.name : id);
     return { ok: true };
   });
@@ -280,6 +293,186 @@ function createApp(overrides = {}) {
     return ctx.srv.host.runShell(b.command, { timeoutMs: b.timeoutMs, cwd });
   });
 
+
+  // --- deploy: server readiness, apps, releases, history ---
+  const inServer = (ctx, rec) => { if (rec.serverId !== ctx.srv.id) throw httpError(404, 'Unknown app on this server'); return rec; };
+  const appOf = (ctx, id) => inServer(ctx, deploy.find(id));
+  const isAdmin = (ctx) => ctx.user.role === 'admin';
+
+  scoped('GET', '/api/provision/status', 'user', async (ctx) => deploy.toolsStatus(ctx.srv.host));
+  scoped('POST', '/api/provision/install', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await deploy.install(ctx.srv.id, b.tools, ctx.user.username);
+    note(ctx, 'provision_install', (b.tools || []).join(' '));
+    return r;
+  });
+  route('GET', '/api/jobs/log', 'admin', async (ctx) => {
+    const id = q(ctx, 'id');
+    if (!/^[A-Za-z0-9-]{8,64}$/.test(id)) throw httpError(400, 'Invalid job id');
+    return deploy.runner.read(id, Number(q(ctx, 'offset', 0)) || 0);
+  });
+
+  scoped('GET', '/api/apps', 'user', async (ctx) => ({ apps: deploy.list(ctx.srv.id, { admin: isAdmin(ctx) }), defaults: { baseDir: config.appsBaseDir } }));
+  scoped('POST', '/api/apps', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 256 * 1024);
+    const app = deploy.create(ctx.srv.id, b, ctx.user.username);
+    if (b.env && typeof b.env === 'object') deploy.setEnv(app.id, b.env);
+    note(ctx, 'app_create', `${app.name} (${app.repoUrl}@${app.branch})`);
+    return { app: deploy.publicApp(app, { admin: true }) };
+  });
+  scoped('GET', '/api/apps/detail', 'user', async (ctx) => {
+    const app = appOf(ctx, q(ctx, 'id'));
+    const [status, releases] = await Promise.all([deploy.status(app).catch((e) => ({ active: 'unknown', error: e.message })), deploy.releases(app).catch(() => [])]);
+    const webhookUrl = isAdmin(ctx) && app.webhookEnabled ? `${config.publicUrl || `${ctx.req.headers['x-forwarded-proto'] || 'http'}://${ctx.req.headers.host}`}/api/hooks/${app.id}/${deploy.publicApp(app, { admin: true }).webhookToken}` : null;
+    return { app: deploy.publicApp(app, { admin: isAdmin(ctx) }), status, releases, deploys: deploy.deploys(app.id, 30), webhookUrl, sites: domains.sites.filter((x) => x.serverId === ctx.srv.id && x.upstream.type === 'app' && x.upstream.appId === app.id).map((x) => ({ id: x.id, domain: x.domain, https: !!x.tls })) };
+  });
+  scoped('PUT', '/api/apps', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 256 * 1024);
+    appOf(ctx, b.id);
+    const app = deploy.update(b.id, b);
+    note(ctx, 'app_update', app.name);
+    return { app: deploy.publicApp(app, { admin: true }) };
+  });
+  scoped('DELETE', '/api/apps', 'admin', async (ctx) => {
+    const app = appOf(ctx, q(ctx, 'id'));
+    await deploy.remove(app.id, { deleteFiles: q(ctx, 'deleteFiles') === '1' });
+    note(ctx, 'app_delete', `${app.name}${q(ctx, 'deleteFiles') === '1' ? ' (files deleted)' : ''}`);
+    return { ok: true };
+  });
+  scoped('PUT', '/api/apps/env', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 512 * 1024);
+    appOf(ctx, b.id);
+    const names = deploy.setEnv(b.id, b.vars);
+    note(ctx, 'app_env', `${deploy.find(b.id).name}: ${Object.keys(b.vars).filter((k) => b.vars[k] !== null).length} set, ${Object.keys(b.vars).filter((k) => b.vars[k] === null).length} removed`);
+    return { names };
+  });
+  scoped('GET', '/api/apps/env', 'admin', async (ctx) => {
+    const app = appOf(ctx, q(ctx, 'id'));
+    note(ctx, 'env_view', `${app.name} (values revealed)`);
+    return { vars: deploy.envOf(app) };
+  });
+  scoped('POST', '/api/apps/env/save', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 512 * 1024);
+    const app = appOf(ctx, b.id);
+    const names = deploy.replaceEnv(app.id, b.vars);
+    note(ctx, 'env_save', `${app.name}: ${names.length} variables`);
+    return { names };
+  });
+  scoped('POST', '/api/apps/env/apply', 'admin', async (ctx) => {
+    const app = appOf(ctx, (await readJson(ctx.req)).id);
+    note(ctx, 'env_apply', app.name);
+    return deploy.applyEnv(app.id);
+  });
+  scoped('POST', '/api/apps/webhook', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = appOf(ctx, b.id);
+    deploy.rotateWebhook(app.id, b.enabled !== false);
+    note(ctx, b.enabled === false ? 'webhook_disable' : 'webhook_rotate', app.name);
+    return { ok: true };
+  });
+  scoped('POST', '/api/apps/deploy', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = appOf(ctx, b.id);
+    const rec = await deploy.deploy(app.id, { trigger: 'manual', user: ctx.user.username, ref: b.ref || undefined });
+    note(ctx, 'deploy', `${app.name} @ ${rec.ref}`);
+    return { deploy: rec };
+  });
+  scoped('POST', '/api/apps/rollback', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = appOf(ctx, b.id);
+    const rec = await deploy.rollback(app.id, b.release, { user: ctx.user.username });
+    note(ctx, 'rollback', `${app.name} -> ${b.release}`);
+    return { deploy: rec };
+  });
+  scoped('POST', '/api/apps/service', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const app = appOf(ctx, b.id);
+    const r = await deploy.service(app, b.action);
+    note(ctx, 'app_' + b.action, app.name);
+    return r;
+  });
+  scoped('GET', '/api/apps/logs', 'admin', async (ctx) => deploy.serviceLogs(appOf(ctx, q(ctx, 'id')), q(ctx, 'lines', 200)));
+  scoped('GET', '/api/deploys/log', 'admin', async (ctx) => {
+    const rec = deploy.findDeploy(q(ctx, 'id'));
+    if (rec.serverId !== ctx.srv.id) throw httpError(404, 'Unknown deploy on this server');
+    return { ...deploy.log(rec.id, Number(q(ctx, 'offset', 0)) || 0), deploy: rec };
+  });
+
+  // --- domains: nginx sites, certificates, DNS / HTTP checks ---
+  const siteOf = (ctx, id) => { const s = domains.find(id); if (s.serverId !== ctx.srv.id) throw httpError(404, 'Unknown domain on this server'); return s; };
+  scoped('GET', '/api/nginx/status', 'user', async (ctx) => domains.nginxStatus(ctx.srv.id));
+  scoped('POST', '/api/nginx/reload', 'admin', async (ctx) => {
+    const t = await domains.nginxTest(ctx.srv.host);
+    if (!t.ok) throw httpError(400, `nginx configuration is invalid; not reloading:\n${t.output}`);
+    await domains.reload(ctx.srv.host);
+    note(ctx, 'nginx_reload');
+    return { ok: true, output: t.output };
+  });
+  scoped('GET', '/api/nginx/files', 'admin', async (ctx) => ({ files: await domains.listFiles(ctx.srv.id), confDir: config.nginxConfDir }));
+  scoped('GET', '/api/nginx/file', 'admin', async (ctx) => domains.readConfFile(ctx.srv.id, q(ctx, 'name')));
+  scoped('PUT', '/api/nginx/file', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 1024 * 1024);
+    const r = await domains.saveConfFile(ctx.srv.id, b.name, b.content);
+    note(ctx, 'nginx_file_save', `${b.name} (${String(b.content).length} bytes${r.created ? ', new file' : ''})`);
+    return r;
+  });
+  scoped('DELETE', '/api/nginx/file', 'admin', async (ctx) => {
+    const r = await domains.deleteConfFile(ctx.srv.id, q(ctx, 'name'));
+    note(ctx, 'nginx_file_delete', q(ctx, 'name'));
+    return r;
+  });
+  scoped('GET', '/api/sites', 'user', async (ctx) => ({ sites: domains.list(ctx.srv.id, isAdmin(ctx)) }));
+  scoped('POST', '/api/sites', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 256 * 1024);
+    const site = await domains.create(ctx.srv.id, b, ctx.user.username);
+    note(ctx, 'site_create', site.domain);
+    return { site: domains.publicSite(site) };
+  });
+  scoped('PUT', '/api/sites', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req, 256 * 1024);
+    siteOf(ctx, b.id);
+    const site = await domains.update(b.id, b);
+    note(ctx, 'site_update', site.domain);
+    return { site: domains.publicSite(site) };
+  });
+  scoped('DELETE', '/api/sites', 'admin', async (ctx) => {
+    const site = siteOf(ctx, q(ctx, 'id'));
+    await domains.remove(site.id, { removeCert: q(ctx, 'removeCert') === '1' });
+    note(ctx, 'site_delete', site.domain);
+    return { ok: true };
+  });
+  scoped('GET', '/api/sites/detail', 'user', async (ctx) => {
+    const site = siteOf(ctx, q(ctx, 'id'));
+    return { site: domains.publicSite(site, isAdmin(ctx)), status: await domains.status(site).catch((e) => ({ error: e.message })) };
+  });
+  scoped('GET', '/api/sites/config', 'admin', async (ctx) => ({ config: await domains.preview(siteOf(ctx, q(ctx, 'id'))) }));
+  scoped('POST', '/api/sites/apply', 'admin', async (ctx) => {
+    const site = siteOf(ctx, (await readJson(ctx.req)).id);
+    const r = await domains.apply(site);
+    note(ctx, 'site_apply', site.domain);
+    return r;
+  });
+  scoped('POST', '/api/sites/cert/issue', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const site = siteOf(ctx, b.id);
+    note(ctx, 'cert_issue', `${site.domain}${b.staging ? ' (staging)' : ''}`);
+    return domains.issue(site.id, { email: b.email, staging: !!b.staging });
+  });
+  scoped('POST', '/api/sites/cert/renew', 'admin', async (ctx) => {
+    const site = siteOf(ctx, (await readJson(ctx.req)).id);
+    note(ctx, 'cert_renew', site.domain);
+    return domains.renew(site.id);
+  });
+  scoped('POST', '/api/sites/cert/remove', 'admin', async (ctx) => {
+    const site = siteOf(ctx, (await readJson(ctx.req)).id);
+    await domains.removeCert(site.id);
+    note(ctx, 'cert_remove', site.domain);
+    return { ok: true };
+  });
+  scoped('GET', '/api/sites/dns', 'user', async (ctx) => domains.dns(siteOf(ctx, q(ctx, 'id'))));
+  scoped('GET', '/api/sites/http', 'user', async (ctx) => domains.http(siteOf(ctx, q(ctx, 'id'))));
+  scoped('GET', '/api/sites/logs', 'admin', async (ctx) => domains.logs(siteOf(ctx, q(ctx, 'id')), q(ctx, 'kind', 'access'), q(ctx, 'lines', 200)));
+
   // --- users & audit ---
   route('GET', '/api/users', 'admin', async () => ({ users: auth.users.map((u) => auth.publicUser(u)) }));
   route('POST', '/api/users', 'admin', async (ctx) => {
@@ -318,6 +511,14 @@ function createApp(overrides = {}) {
     }
 
     try {
+      // Deploy webhooks authenticate by secret URL token or GitHub HMAC signature (no cookie, so no CSRF header).
+      if (req.method === 'POST' && url.pathname.startsWith('/api/hooks/')) {
+        const [appId, token] = url.pathname.slice('/api/hooks/'.length).split('/');
+        const raw = await readBody(req, 1024 * 1024);
+        const h = await deploy.webhook(appId, token, req.headers, raw, ip);
+        audit.write({ user: 'webhook', ip, action: 'webhook', detail: `${appId}: ${JSON.stringify(h.body).slice(0, 200)}` });
+        return sendJson(res, h.status, h.body);
+      }
       const r = routes.find((x) => x.method === req.method && x.p === url.pathname);
       if (!r) throw httpError(routes.some((x) => x.p === url.pathname) ? 405 : 404, 'Not found');
 
@@ -349,7 +550,7 @@ function createApp(overrides = {}) {
 
   const server = http.createServer((req, res) => { handle(req, res); });
   server.requestTimeout = 0; // allow long uploads; body size is limited separately
-  return { server, config, auth, store, audit, servers, vault };
+  return { server, config, auth, store, audit, servers, vault, deploy, domains };
 }
 
 function main() {

@@ -10,6 +10,8 @@ Node ≥ 20, vanilla-JS frontend, no build step. The one runtime dependency (`ss
 |---|---|
 | **Dashboard** | Live CPU (total + per-core), memory/swap, network throughput, disks, system info, EC2 instance details (IMDSv2), threshold alerts |
 | **Processes** | Sortable/filterable list; send SIGTERM/SIGKILL (admin) |
+| **Deploy** | Node.js apps from Git: clone → install → build → zero-downtime switch → health check → **automatic rollback**; live deploy log, history, one-click rollback to any kept release, `.env` editor, webhook auto-deploy, service controls and logs |
+| **Domains** | nginx virtual hosts for apps / URLs / static sites, **Let's Encrypt** certificates with auto-renewal, DNS checks (3 resolvers, A/AAAA/CNAME/NS/MX/TXT/CAA), HTTP/HTTPS checks including *direct-to-server* before DNS cut-over, **editable nginx config** (per domain and `nginx.conf` / `conf.d`) |
 | **Services** | systemd units: state, enable/disable, start/stop/restart, `systemctl status` |
 | **Updates** | `dnf` updates with security advisories (ALAS), reboot-required notice; update one package / security-only / all |
 | **Docker** | Containers (state, CPU, memory, ports) and images; start/stop/restart/remove, logs |
@@ -30,7 +32,7 @@ node server/index.js          # prints a one-time setup token — no `npm instal
 Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
 
 ```bash
-npm test    # 46 tests, including end-to-end SSH/SFTP against a real sshd (skipped if sshd isn't installed)
+npm test    # 94 tests: unit tests + end-to-end SSH/SFTP/deploy/nginx tests against a real sshd (skipped if sshd isn't installed)
 ```
 
 ## Adding a server
@@ -61,6 +63,53 @@ connections are instant. The Argon2 code is verified against the RFC 9106 test v
 `dnf upgrade` the SSH user needs passwordless `sudo` (`ec2-user` has it). Without sudo the panel still works read-only where possible
 (monitoring, process list, service list, files you own). Optional: `cronie` (Cron page), Docker, `dnf-utils` (reboot notice).
 Servers reachable only through SSM Session Manager (no SSH port at all) are **not** supported.
+
+## Deploying apps
+
+**Deploy → Prepare server** installs git, Node.js, nginx and certbot with `dnf` (one click, with a live log). Then **New app**:
+repository URL (HTTPS or SSH; public, access token, or deploy key), branch/tag, port, optional install/build/start commands (defaults: `npm ci`,
+`npm run build` if present, `npm start`), environment variables, health-check path.
+
+Each deploy, on the target server:
+
+1. clones the branch into a fresh `releases/<timestamp>` folder (shallow, no `.git` kept), writes the `.env`, runs install and build (with the `.env` loaded);
+2. writes/updates a `panel-app-<name>.service` systemd unit, switches the `current` symlink atomically, restarts the service;
+3. waits for the health check (default: any HTTP answer below 500 within 30 s; configurable, optionally 2xx/3xx only);
+4. **if it fails, switches back to the previous release, restarts, and verifies that one is healthy again**: the deploy is reported as *rolled back* (or *failed* if the old version is also down, never silently "fine");
+5. prunes old releases (default keep 5, never the live or previous one).
+
+A failed clone/install/build never touches the running release. One deploy per app at a time. History keeps the log of every deploy; **Releases** lets you roll back to any kept release.
+Layout on the server: `/srv/apps/<name>/{releases/, shared/{.env,start.sh}, current}` (configurable per app).
+
+**Secrets** (git token / deploy key, env values) are encrypted in the panel's store and reach the server only inside the script sent over the SSH channel's stdin
+(never in a process command line); the deploy key and token helper exist only in a private temp directory for the duration of the clone. SSH deploy keys use `StrictHostKeyChecking=accept-new` (trust on first use) for the git host.
+
+**Environment (.env) editor:** admins can **Reveal & edit** the whole file as `NAME=value` text (quotes, `#` and newlines are handled), then **Save** (next deploy) or
+**Save & apply now** (writes the file and restarts the service, no rebuild; you are told if the app does not come back healthy). Revealing values is audited; viewers only see variable names;
+values are never written to the audit log. `PORT` and `NODE_ENV` are set by the panel.
+
+**Webhook auto-deploy:** enable it on the app page to get a URL + secret. GitHub (push event, `application/json`, HMAC-SHA256 signature) or any CI (`curl -X POST <url>`) triggers a deploy of the app's branch;
+other branches/events are ignored, calls are rate-limited, rotating the secret invalidates the old one. The panel must be reachable from the internet at that URL (set `PANEL_PUBLIC_URL`
+behind a reverse proxy and expose only `/api/hooks/`).
+
+## Domains, HTTPS and nginx
+
+**Domains → Add domain** creates `/etc/nginx/conf.d/panel-<domain>.conf` (reverse proxy to an app or URL, or static files with optional SPA fallback), validates it with `nginx -t`
+(a rejected config is rolled back byte for byte) and reloads nginx. Websockets work, large uploads are configurable, IPv6 listeners are only emitted on hosts that have IPv6.
+
+**Checks** (Overview tab): DNS from the system resolver plus Cloudflare and Google (flags wrong IPs, missing records, propagation differences, AAAA that would break visitors, CAA that blocks Let's Encrypt),
+HTTP/HTTPS status, redirects, certificate trust/expiry/name coverage, and the same tests *directly against the server's IP*, so you can verify a new site before pointing DNS at it.
+
+**HTTPS:** *Issue certificate* runs certbot (webroot validation on port 80), then rewrites the site with a TLS server block and an HTTP→HTTPS redirect. Staging mode for test runs, *Renew now*, *Remove certificate*.
+Renewal is automatic through the `certbot-renew.timer` the panel installs (twice a day, reloads nginx via a deploy hook). A failed request changes nothing.
+
+**Editing nginx:**
+- *Per domain:* use the settings and "custom directives", or **Edit full config manually** to own the whole file (manual mode; switch back any time).
+- *Server-wide:* **Edit config files…** opens `nginx.conf` and every file in `conf.d` (create / edit / delete); panel-generated files are shown read-only.
+- Every save is written, checked with `nginx -t`, and reloaded; on failure the previous content is restored and nginx's error is shown. A `.panel-bak` copy of the previous version is kept.
+
+Requirements on the managed server: the SSH user needs **passwordless sudo** (default for `ec2-user`) for services, nginx and certbot; ports 80/443 open in the security group; DNS pointing at the instance (Elastic IP recommended).
+`PANEL_ENABLE_LOCAL` (managing the panel's own host with the limited sudoers rules from `--manage-local`) does not cover deploy/domains, which need broader sudo: manage hosts over SSH instead.
 
 ## Install the panel on Amazon Linux 2023
 
@@ -105,9 +154,13 @@ panel is meant to manage remote servers.
 | `PANEL_ENABLE_EXEC` | `true` | Set `false` to disable the Terminal page entirely |
 | `PANEL_USE_SUDO` | `true` | Local host only: use `sudo -n` when not root |
 | `PANEL_SECURE_COOKIES` | `false` | Set `true` behind HTTPS |
+| `PANEL_PUBLIC_URL` | *(request host)* | Base URL shown for webhook URLs (set behind a reverse proxy) |
 | `PANEL_SESSION_HOURS` | `12` | Session lifetime |
 | `PANEL_MAX_UPLOAD_MB` | `200` | Upload limit |
 | `PANEL_SAMPLE_MS` / `PANEL_HISTORY` | `3000` / `200` | Metrics interval / points kept (sampling only runs while someone is viewing a server) |
+
+Paths on the managed servers can be changed with `PANEL_APPS_DIR` (`/srv/apps`), `PANEL_UNIT_DIR`, `PANEL_NGINX_CONF_DIR`, `PANEL_NGINX_LOG_DIR`, `PANEL_NGINX_CONF`, `PANEL_LETSENCRYPT_DIR`, `PANEL_ACME_ROOT` (mainly for tests).
+`PANEL_ALLOW_LOCAL_REPOS=true` permits `file://` repositories (tests only; leave off).
 
 ## Security model — read this before exposing it
 
@@ -128,7 +181,9 @@ This tool holds SSH keys to your servers and can restart services, delete files 
 - Login is throttled per IP; first-run setup needs the console token.
 - Every value sent to a server is shell-quoted or validated (unit names, container IDs, package names, signals, paths); the file manager and log viewer are confined
   (traversal and symlink escapes blocked, verified by tests against a real SFTP server). Only the Terminal page runs arbitrary shell: admin-only and audited.
-- Viewers can monitor every server but cannot reach Files, Logs, Cron, Terminal, Servers, Users or Audit, and cannot change anything.
+- Deploy/domain inputs are validated and quoted: repository URLs (no `ext::`/option injection, `GIT_ALLOW_PROTOCOL` restricted), branch names, commands, ports, domains, upstreams, file names, environment names. Admin-supplied build/start commands and nginx directives are *meant* to run/apply as written, so the admin role is powerful; nginx edits are always validated and rolled back.
+- Viewers can monitor every server (including app/domain status, DNS and HTTP checks) but cannot reach Files, Logs, Cron, Terminal, Servers, Users, Audit, deploy logs, env values, webhook secrets or nginx text, and cannot change anything.
+- Domain checks make the panel host resolve and connect to registered domains (admin-created); only status, headers and certificate details are returned.
 
 ## Layout
 

@@ -1,0 +1,5 @@
+#!/bin/bash
+STATE="${SHIM_STATE:?}"; u=""
+while [ $# -gt 0 ]; do case "$1" in -u) u="$2"; shift;; esac; shift; done
+tail -n 40 "$STATE/$u.log" 2>/dev/null
+exit 0

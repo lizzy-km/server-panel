@@ -1,0 +1,24 @@
+#!/bin/bash
+# fake certbot: mints self-signed certificates in the layout certbot uses
+cmd="$1"; shift
+dir=/etc/letsencrypt; name=""; domains=(); webroot=""
+while [ $# -gt 0 ]; do case "$1" in
+  --config-dir) dir="$2"; shift;; --cert-name) name="$2"; shift;; -d) domains+=("$2"); shift;; -w) webroot="$2"; shift;;
+esac; shift; done
+mk() {
+  mkdir -p "$dir/live/$name"
+  san=$(printf 'DNS:%s,' "${domains[@]}"); san=${san%,}
+  openssl req -x509 -newkey rsa:2048 -nodes -days 90 -subj "/CN=${domains[0]:-$name}" -addext "subjectAltName=$san" \
+    -keyout "$dir/live/$name/privkey.pem" -out "$dir/live/$name/fullchain.pem" 2>/dev/null
+  echo "$(date +%s%N)" > "$dir/live/$name/.stamp"
+  printf '%s\n' "${domains[@]}" > "$dir/live/$name/.domains"
+}
+case "$cmd" in
+  certonly)
+    case "$name" in *fail*) echo "Challenge failed for domain $name" >&2; echo "Some challenges have failed." >&2; exit 1;; esac
+    [ -d "$webroot" ] || { echo "webroot $webroot missing" >&2; exit 1; }
+    mk; echo "Successfully received certificate."; echo "Deploy hook would run: reload nginx";;
+  renew) domains=($(cat "$dir/live/$name/.domains" 2>/dev/null)); [ -d "$dir/live/$name" ] || { echo "no such cert" >&2; exit 1; }; mk; echo "Congratulations, all renewals succeeded";;
+  delete) rm -rf "$dir/live/$name"; echo "Deleted all files relating to certificate $name.";;
+  *) echo "shim: unsupported certbot $cmd" >&2; exit 1;;
+esac
