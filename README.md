@@ -31,7 +31,7 @@ node server/index.js          # prints a one-time setup token
 Open <http://127.0.0.1:8080>, enter the setup token and create the admin account, then **Servers → Add server**.
 
 ```bash
-npm test    # 42 tests, including end-to-end SSH/SFTP against a real sshd (skipped if sshd isn't installed)
+npm test    # 46 tests, including end-to-end SSH/SFTP against a real sshd (skipped if sshd isn't installed)
 ```
 
 ## Adding a server
@@ -45,15 +45,17 @@ You need: the server's **address** (public DNS / IP), the **username** (`ec2-use
    someone intercepting the connection) the panel refuses to connect until an admin re-verifies it.
 3. The panel logs in, checks the user and whether passwordless sudo works, and only then saves the server.
 
-**Supported key formats**
+**Supported key formats** (use whatever you have — `.pem` from AWS or `.ppk` from PuTTYgen)
 
 | Format | Support |
 |---|---|
 | AWS `.pem` (RSA), OpenSSH private keys (RSA / ECDSA / Ed25519), with or without passphrase | ✅ |
-| PuTTY `.ppk` v2 (RSA / ECDSA / Ed25519), with or without passphrase | ✅ |
-| PuTTY `.ppk` v3 **without** a passphrase | ✅ |
-| PuTTY `.ppk` v3 **with** a passphrase | ❌ (needs Argon2, unavailable in Node 22). In PuTTYgen use *Conversions → Export OpenSSH key*, or save as v2, or remove the passphrase |
+| PuTTY `.ppk` v2 and v3 (RSA / ECDSA / Ed25519), with or without passphrase — including PuTTYgen's default v3 + Argon2id | ✅ |
 | Public keys (`.pub`) | ❌ rejected with a clear message |
+
+PuTTY v3 keys with a passphrase are decrypted with a built-in pure-JavaScript Argon2 (Node 22 has none), run in a worker thread; PuTTYgen's
+default settings take about 2 seconds, once, when you add the server. The key is then stored (encrypted) in converted form, so later
+connections are instant. The Argon2 code is verified against the RFC 9106 test vector and an independent reference implementation.
 
 **What the target server needs** (all true by default on Amazon Linux 2023): `sshd` reachable from the panel on the SSH port
 (security group inbound rule for port 22 from the panel's IP or security group); for service control, journal access and
@@ -125,6 +127,7 @@ This tool holds SSH keys to your servers and can restart services, delete files 
 server/index.js         HTTP server, routing, auth/CSRF pipeline, server-scoped routes (?server=<id>)
 server/lib/host.js      LocalHost + SshHost (ssh2 exec/SFTP, host-key pinning, sudo fallback)
 server/lib/keys.js      .pem / OpenSSH / .ppk loading and PPK v2/v3 conversion
+server/lib/argon2.js    pure-JS Argon2 (for passphrase-protected PPK v3)
 server/lib/vault.js     AES-256-GCM encryption of stored secrets
 server/lib/servers.js   server registry: add/verify/update/remove, live connections
 server/lib/sys.js       metrics sampler, disks, processes, sockets (via a host)

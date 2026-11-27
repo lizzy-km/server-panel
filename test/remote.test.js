@@ -130,6 +130,24 @@ test('PuTTY .ppk keys work end to end', { skip: skip || !putty }, async () => {
   await call('DELETE', '/api/servers?id=' + ed.json.server.id);
 });
 
+test('passphrase-protected PuTTY v3 .ppk (what PuTTYgen saves by default) works end to end', { skip: skip || !putty }, async () => {
+  const ppk = toPpk(keys.dir, keys.rsa, 3, 'open-sesame'); // unprotected source key, re-saved with a passphrase
+  assert.equal((await addServer({ name: 'ppk3-pw', privateKey: ppk })).status, 400, 'passphrase required');
+  assert.equal((await addServer({ name: 'ppk3-pw', privateKey: ppk, passphrase: 'nope' })).status, 400);
+  const t0 = Date.now();
+  const r = await addServer({ name: 'ppk3-pw', privateKey: ppk, passphrase: 'open-sesame' });
+  assert.equal(r.status, 200, r.raw);
+  assert.equal(r.json.server.keyFingerprint, keys.rsa.fp);
+  assert.ok(!/PuTTY-User|PRIVATE KEY|open-sesame/.test(fs.readFileSync(path.join(dataDir, 'panel.json'), 'utf8')), 'neither key nor passphrase stored in the clear');
+  const ready = Date.now() - t0;
+  // later connections reuse the converted key, so there is no second multi-second Argon2 run
+  const t1 = Date.now();
+  const e = app.servers.entry(r.json.server.id);
+  assert.equal((await e.host.run('echo', ['again'])).stdout.trim(), 'again');
+  assert.ok(Date.now() - t1 < Math.max(1500, ready / 2), `reconnect took ${Date.now() - t1} ms`);
+  await call('DELETE', '/api/servers?id=' + r.json.server.id);
+});
+
 test('remote monitoring: system info, metrics, processes, ports', { skip }, async () => {
   const sys = await call('GET', '/api/system');
   assert.equal(sys.status, 200, sys.raw);

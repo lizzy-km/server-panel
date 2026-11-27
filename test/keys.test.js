@@ -2,7 +2,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const { loadKey } = require('../server/lib/keys');
+const { loadKey, loadKeyAsync } = require('../server/lib/keys');
+const { argon2, blake2b } = require('../server/lib/argon2');
+const crypto = require('crypto');
 const { Vault } = require('../server/lib/vault');
 const { shq, fingerprint } = require('../server/lib/host');
 const { hasBin, tmp, genKey, toPpk } = require('./helpers');
@@ -79,8 +81,40 @@ test('PPK: passphrase handling and integrity', { skip: !putty }, () => {
   assert.equal(loadKey(toPpk(dir, ed, 2, 'hunter22'), 'hunter22').fingerprint, ed.fp);
   assert.throws(() => loadKey(v2pw), /passphrase-protected/);
   assert.throws(() => loadKey(v2pw, 'nope'), /Wrong passphrase/);
-  assert.throws(() => loadKey(toPpk(dir, k, 3, 'hunter22'), 'hunter22'), /PPK v3 keys protected by a passphrase are not supported/);
   const v3 = toPpk(dir, k, 3);
   const tampered = v3.replace(/^Comment: .*/m, 'Comment: evil');
   assert.throws(() => loadKey(tampered), /integrity check/);
+});
+
+test('Argon2 matches the RFC 9106 test vector and BLAKE2b matches Node', () => {
+  const tag = argon2({ type: 'id', password: Buffer.alloc(32, 1), salt: Buffer.alloc(16, 2), secret: Buffer.alloc(8, 3), ad: Buffer.alloc(12, 4), memory: 32, passes: 3, parallelism: 4, tagLength: 32 });
+  assert.equal(tag.toString('hex'), '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659');
+  for (const n of [0, 1, 128, 129, 1000]) {
+    const d = crypto.randomBytes(n);
+    assert.ok(blake2b(d, 64).equals(crypto.createHash('blake2b512').update(d).digest()), `blake2b ${n}`);
+  }
+});
+
+test('passphrase-protected PPK v3 (PuTTYgen default: Argon2id) opens with the right passphrase only', { skip: !putty }, async () => {
+  const dir = tmp('ppk3-');
+  for (const [type, opts] of [['rsa', { bits: 2048 }], ['ecdsa', { bits: 256 }], ['ed25519', {}]]) {
+    const k = genKey(dir, `k_${type}`, type, opts);
+    const ppk = toPpk(dir, k, 3, 'correct horse');
+    assert.match(ppk, /Key-Derivation: Argon2id/);
+    assert.equal((await loadKeyAsync(ppk, 'correct horse')).fingerprint, k.fp, type);
+    await assert.rejects(loadKeyAsync(ppk, 'wrong horse'), /Wrong passphrase/);
+    await assert.rejects(loadKeyAsync(ppk), /passphrase-protected/);
+    const tampered = ppk.replace(/^Comment: .*/m, 'Comment: evil');
+    await assert.rejects(loadKeyAsync(tampered, 'correct horse'), /Wrong passphrase|damaged/);
+  }
+});
+
+test('hostile Argon2 parameters inside a .ppk are refused before any work happens', { skip: !putty }, async () => {
+  const dir = tmp('ppk3b-');
+  const ppk = toPpk(dir, genKey(dir, 'k', 'ed25519'), 3, 'pw-pw-pw');
+  for (const [from, to] of [[/Argon2-Memory: \d+/, 'Argon2-Memory: 4000000'], [/Argon2-Passes: \d+/, 'Argon2-Passes: 100000'], [/Argon2-Parallelism: \d+/, 'Argon2-Parallelism: 500']]) {
+    const t0 = Date.now();
+    await assert.rejects(loadKeyAsync(ppk.replace(from, to), 'pw-pw-pw'), /expensive Argon2|integrity|Wrong passphrase/);
+    assert.ok(Date.now() - t0 < 1500, 'must be rejected immediately');
+  }
 });

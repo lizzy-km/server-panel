@@ -2,7 +2,7 @@
 const crypto = require('crypto');
 const { httpError } = require('./auth');
 const { LocalHost, SshHost, probeHostKey } = require('./host');
-const { loadKey } = require('./keys');
+const { loadKey, loadKeyAsync } = require('./keys');
 const { Sampler, systemInfo } = require('./sys');
 const { FileManager, LogReader } = require('./ops');
 const { fetchInstanceMetadata } = require('./aws');
@@ -147,7 +147,7 @@ class ServerRegistry {
     const v = clean(input);
     if (!FP_RE.test(String(input.hostKey || ''))) throw httpError(400, 'Confirm the server host key fingerprint first');
     if (this.records.some((r) => r.name.toLowerCase() === v.name.toLowerCase())) throw httpError(409, 'A server with that name already exists');
-    const key = loadKey(input.privateKey, input.passphrase);
+    const key = await loadKeyAsync(input.privateKey, input.passphrase);
     const rec = { id: crypto.randomUUID(), ...v, hostKey: input.hostKey, useSudo: v.useSudo !== false };
     const info = await this.verify(rec, key);
     Object.assign(rec, {
@@ -173,7 +173,7 @@ class ServerRegistry {
     }
     let key = null;
     if (input.privateKey) {
-      key = loadKey(input.privateKey, input.passphrase);
+      key = await loadKeyAsync(input.privateKey, input.passphrase);
       Object.assign(next, { keyEnc: this.vault.encrypt(key.privateKey), passEnc: key.passphrase ? this.vault.encrypt(key.passphrase) : null, keyType: key.type, keyFingerprint: key.fingerprint, keyComment: key.comment });
     }
     // anything that affects how we connect must be re-verified before it is saved

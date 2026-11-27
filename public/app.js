@@ -787,7 +787,7 @@ function readFileText(file) {
 /** Key picker: choose a .pem/.ppk file or paste its text. Exposes get(). */
 function keyField(initialHint) {
   let text = '';
-  const status = h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, initialHint || 'Accepted: AWS .pem, OpenSSH private key, PuTTY .ppk (v2, or v3 without a passphrase).');
+  const status = h('div', { class: 'muted', style: { fontSize: '12px', marginTop: '4px' } }, initialHint || 'Accepted: AWS .pem, OpenSSH private key, PuTTY .ppk (v2 or v3, with or without passphrase).');
   const area = h('textarea', { rows: 4, spellcheck: false, placeholder: '…or paste the private key here (-----BEGIN … PRIVATE KEY----- / PuTTY-User-Key-File-…)', oninput: () => { text = area.value; } });
   area.style.fontSize = '11px';
   const file = h('input', {

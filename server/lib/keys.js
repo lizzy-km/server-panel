@@ -1,14 +1,14 @@
 'use strict';
 /**
  * Private-key loading for SSH: PEM (PKCS#1/PKCS#8/EC) and OpenSSH keys (via ssh2), and PuTTY .ppk
- * v2 (with or without passphrase) and unencrypted v3, converted here. Passphrase-protected PPK v3
- * needs Argon2, which Node 22 does not provide, so it is rejected with instructions.
+ * v2 and v3 (with or without passphrase), converted here. Passphrase-protected v3 uses Argon2,
+ * which Node 22 lacks, so ./argon2.js provides a pure-JS implementation (run via loadKeyAsync).
  */
 const crypto = require('crypto');
 const { utils } = require('ssh2');
 const { httpError } = require('./auth');
+const { argon2Async } = require('./argon2');
 
-const PPK3_ENCRYPTED_HELP = 'PPK v3 keys protected by a passphrase are not supported. In PuTTYgen use Conversions → Export OpenSSH key (or save the key as PPK v2 / without a passphrase), then upload that file.';
 
 function fingerprintOf(blob) {
   return 'SHA256:' + crypto.createHash('sha256').update(blob).digest('base64').replace(/=+$/, '');
@@ -39,7 +39,7 @@ function parsePpkText(text) {
   let i = 1;
   const blocks = {};
   for (; i < lines.length; i++) {
-    const m = lines[i].match(/^([A-Za-z-]+):\s?(.*)$/);
+    const m = lines[i].match(/^([A-Za-z0-9-]+):\s?(.*)$/);
     if (!m) continue;
     const key = m[1];
     if (key === 'Public-Lines' || key === 'Private-Lines') {
@@ -68,23 +68,31 @@ function ed25519ToOpenSsh(pub, seed, comment) {
 
 const CURVES = { 'nistp256': ['P-256', 32], 'nistp384': ['P-384', 48], 'nistp521': ['P-521', 66] };
 
-function ppkToPem(text, passphrase) {
+function ppkToPem(text, passphrase, derived) {
   let k;
   try { k = parsePpkText(text); } catch { throw httpError(400, 'This does not look like a valid PuTTY .ppk file'); }
   if (!k.pub || !k.priv) throw httpError(400, 'Corrupt PPK file');
   const encryption = k.fields.Encryption || 'none';
-  if (k.version >= 3 && encryption !== 'none') throw httpError(400, PPK3_ENCRYPTED_HELP);
   if (k.version === 2 && !['none', 'aes256-cbc'].includes(encryption)) throw httpError(400, `Unsupported PPK encryption: ${encryption}`);
+  if (k.version >= 3 && !['none', 'aes256-cbc'].includes(encryption)) throw httpError(400, `Unsupported PPK encryption: ${encryption}`);
   if (encryption !== 'none' && !passphrase) throw httpError(400, 'This key is passphrase-protected — enter the passphrase');
+  if (k.version >= 3 && encryption !== 'none' && !derived) throw httpError(500, 'Internal error: PPK v3 key derivation was not performed');
 
   const sha1 = (...parts) => crypto.createHash('sha1').update(Buffer.concat(parts.map((p) => Buffer.from(p)))).digest();
   const counter = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
   const pw = passphrase || '';
+  let macKey = Buffer.alloc(0);
   if (encryption === 'aes256-cbc') {
-    // PPK v2: key = SHA1(0||pass) || SHA1(1||pass) (first 32 bytes), IV = 0
-    const key = Buffer.concat([sha1(counter(0), pw), sha1(counter(1), pw)]).subarray(0, 32);
+    let cipherKey; let iv;
+    if (k.version >= 3) {
+      // PPK v3: Argon2 output (80 bytes) = AES key (32) | IV (16) | MAC key (32)
+      cipherKey = derived.subarray(0, 32); iv = derived.subarray(32, 48); macKey = derived.subarray(48, 80);
+    } else {
+      // PPK v2: key = SHA1(0||pass) || SHA1(1||pass) (first 32 bytes), IV = 0
+      cipherKey = Buffer.concat([sha1(counter(0), pw), sha1(counter(1), pw)]).subarray(0, 32); iv = Buffer.alloc(16);
+    }
     try {
-      const d = crypto.createDecipheriv('aes-256-cbc', key, Buffer.alloc(16));
+      const d = crypto.createDecipheriv('aes-256-cbc', cipherKey, iv);
       d.setAutoPadding(false);
       k.priv = Buffer.concat([d.update(k.priv), d.final()]);
     } catch { throw httpError(400, 'Wrong passphrase, or the key file is damaged'); }
@@ -93,7 +101,7 @@ function ppkToPem(text, passphrase) {
   // integrity: v3 = HMAC-SHA256 (empty key when unencrypted); v2 = HMAC-SHA1 keyed by SHA1("putty-private-key-file-mac-key"+pass)
   const macData = Buffer.concat([k.algo, encryption, k.fields.Comment || ''].map((x) => lenPrefixed(Buffer.from(x))).concat([lenPrefixed(k.pub), lenPrefixed(k.priv)]));
   const mac = k.version >= 3
-    ? crypto.createHmac('sha256', Buffer.alloc(0)).update(macData).digest('hex')
+    ? crypto.createHmac('sha256', macKey).update(macData).digest('hex')
     : crypto.createHmac('sha1', sha1('putty-private-key-file-mac-key', pw)).update(macData).digest('hex');
   if (k.fields['Private-MAC'] && mac !== k.fields['Private-MAC'].toLowerCase()) {
     throw httpError(400, encryption === 'none' ? 'PPK file failed its integrity check (corrupt or modified)' : 'Wrong passphrase, or the key file is damaged');
@@ -143,11 +151,11 @@ function ppkToPem(text, passphrase) {
  * Validate and normalise a user-supplied key.
  * @returns {{privateKey: string, passphrase?: string, type: string, comment: string, fingerprint: string}}
  */
-function loadKey(input, passphrase) {
+function loadKey(input, passphrase, derived) {
   let text = String(input || '').replace(/^﻿/, '').trim();
   if (!text) throw httpError(400, 'No private key provided');
   if (text.length > 64 * 1024) throw httpError(400, 'Key file is too large');
-  if (/^PuTTY-User-Key-File-[23]:/.test(text)) { text = ppkToPem(text, passphrase); passphrase = undefined; }
+  if (/^PuTTY-User-Key-File-[23]:/.test(text)) { text = ppkToPem(text, passphrase, derived); passphrase = undefined; }
   else if (!/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)) {
     throw httpError(400, 'Unrecognised key format. Upload an AWS .pem, an OpenSSH private key, or a PuTTY .ppk file (not a .pub public key).');
   }
@@ -169,4 +177,31 @@ function loadKey(input, passphrase) {
   };
 }
 
-module.exports = { loadKey, ppkToPem, fingerprintOf };
+// Work limits for the (attacker-controllable) Argon2 parameters inside a .ppk file.
+// PuTTYgen's default is 8192 KiB x 13 passes x 1 lane (~2 s here).
+const ARGON_LIMITS = { memory: 262144, work: 2_000_000, parallelism: 16 };
+
+function ppkV3Kdf(text, passphrase) {
+  let k;
+  try { k = parsePpkText(text); } catch { throw httpError(400, 'This does not look like a valid PuTTY .ppk file'); }
+  const f = k.fields;
+  const type = { argon2id: 'id', argon2i: 'i', argon2d: 'd' }[String(f['Key-Derivation'] || '').toLowerCase()];
+  const memory = Number(f['Argon2-Memory']); const passes = Number(f['Argon2-Passes']); const parallelism = Number(f['Argon2-Parallelism']);
+  if (!type || !/^[0-9a-f]+$/i.test(f['Argon2-Salt'] || '') || !(memory >= 8) || !(passes >= 1) || !(parallelism >= 1)) throw httpError(400, 'Corrupt PPK v3 key-derivation header');
+  if (memory > ARGON_LIMITS.memory || memory * passes > ARGON_LIMITS.work || parallelism > ARGON_LIMITS.parallelism) {
+    throw httpError(400, 'This key uses unusually expensive Argon2 settings; re-save it with PuTTYgen defaults or export an OpenSSH key');
+  }
+  return { type, password: Buffer.from(passphrase), salt: Buffer.from(f['Argon2-Salt'], 'hex'), memory, passes, parallelism, tagLength: 80 };
+}
+
+/** Like loadKey, but can also open passphrase-protected PPK v3 (Argon2 runs in a worker thread, ~2 s). */
+async function loadKeyAsync(input, passphrase) {
+  const text = String(input || '').replace(/^\uFEFF/, '').trim();
+  if (/^PuTTY-User-Key-File-3:/.test(text) && passphrase && /^Encryption:\s*(?!none)\S+/m.test(text)) {
+    const derived = await argon2Async(ppkV3Kdf(text, passphrase));
+    return loadKey(text, passphrase, derived);
+  }
+  return loadKey(input, passphrase);
+}
+
+module.exports = { loadKey, loadKeyAsync, ppkToPem, fingerprintOf };
