@@ -1,0 +1,18 @@
+#!/bin/bash
+# fake sshd: -t validates the drop-in files, -T prints the effective settings (first value wins, like the real one)
+STATE="${SHIM_STATE:?}"; D="$STATE/sshd.d"
+case "$1" in
+  -t) if grep -qsi '^bogus' "$D"/*.conf 2>/dev/null; then echo "$D: line 2: Bad configuration option: Bogus" >&2; exit 255; fi; exit 0;;
+  -T)
+    declare -A v; order=(port permitrootlogin passwordauthentication pubkeyauthentication kbdinteractiveauthentication maxauthtries x11forwarding)
+    v[port]=22; v[permitrootlogin]=yes; v[passwordauthentication]=yes; v[pubkeyauthentication]=yes; v[kbdinteractiveauthentication]=no; v[maxauthtries]=6; v[x11forwarding]=no
+    declare -A seen
+    for f in "$D"/*.conf "$STATE/sshd.force"; do [ -f "$f" ] || continue
+      while read -r k val _; do k=$(echo "$k" | tr A-Z a-z); case "$k" in ''|\#*) continue;; esac
+        [ "$f" = "$STATE/sshd.force" ] && { v[$k]="$val"; continue; }
+        [ -n "${seen[$k]:-}" ] || { v[$k]="$val"; seen[$k]=1; }
+      done < "$f"
+    done
+    for k in "${order[@]}"; do echo "$k ${v[$k]}"; done; exit 0;;
+esac
+exit 0

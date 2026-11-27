@@ -1,0 +1,10 @@
+#!/bin/bash
+STATE="${SHIM_STATE:?}"; B="$STATE/f2b.banned"; touch "$B"
+[ -f "$STATE/fail2ban.active" ] || { echo "ERROR Failed to access socket path" >&2; exit 255; }
+case "$1 $2" in
+  "status sshd") ls "$STATE"/jail.d/panel.local >/dev/null 2>&1 || { echo "ERROR NOK: ('sshd',)" >&2; exit 255; }
+    n=$(grep -c . "$B"); printf 'Status for the jail: sshd\n|- Filter\n|  `- Currently failed:\t0\n`- Actions\n   |- Currently banned:\t%s\n   |- Total banned:\t%s\n   `- Banned IP list:\t%s\n' "$n" "$((n+2))" "$(tr '\n' ' ' < "$B")";;
+  "set sshd") [ "$3" = unbanip ] && { grep -vx "$4" "$B" > "$B.2"; mv "$B.2" "$B"; echo "$4"; };;
+  *) ;;
+esac
+exit 0

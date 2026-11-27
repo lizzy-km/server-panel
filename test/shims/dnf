@@ -1,0 +1,15 @@
+#!/bin/bash
+# fake dnf: "install" makes the fake packages appear
+STATE="${SHIM_STATE:?}"
+echo "$*" >> "$STATE/dnf.log"
+args=(); for a in "$@"; do case "$a" in -y|-q|--quiet) ;; *) args+=("$a");; esac; done
+case "${args[0]:-}" in
+  install)
+    for p in "${args[@]:1}"; do case "$p" in
+      firewalld) cp "$SHIM_AVAIL/firewall-cmd" "$SHIM_BIN/";;
+      fail2ban) [ -f "$STATE/dnf.unavailable" ] && { echo "No match for argument: fail2ban" >&2; exit 1; }; cp "$SHIM_AVAIL/fail2ban-client" "$SHIM_BIN/";;
+      dnf-automatic) printf '[commands]\nupgrade_type = default\napply_updates = no\n' > "$STATE/automatic.conf";;
+      *) echo "shim: cannot install $p" >&2; exit 1;;
+    esac; done; exit 0;;
+  *) echo "shim: unsupported dnf ${args[*]}" >&2; exit 1;;
+esac

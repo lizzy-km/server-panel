@@ -31,6 +31,11 @@ function loadConfig(env = process.env) {
     phpSocket: env.PANEL_PHP_SOCKET || 'unix:/run/php-fpm/www.sock', // PHP-FPM socket nginx talks to
     backupRoot: env.PANEL_BACKUP_DIR || '/var/backups/panel/jobs',
     backupScriptDir: env.PANEL_BACKUP_SCRIPT_DIR || '/opt/panel-backups',
+    sshdDropinDir: env.PANEL_SSHD_DROPIN_DIR || '/etc/ssh/sshd_config.d',
+    fail2banJailDir: env.PANEL_FAIL2BAN_JAIL_DIR || '/etc/fail2ban/jail.d',
+    dnfAutomaticConf: env.PANEL_DNF_AUTOMATIC_CONF || '/etc/dnf/automatic.conf',
+    sshRollbackSeconds: Number(env.PANEL_SSH_ROLLBACK_SECONDS) || 90, // the server undoes an SSH hardening change by itself if the panel does not confirm it
+    webUser: env.PANEL_WEB_USER || 'nginx', // the user nginx runs as (folder access checks)
     exportDir: env.PANEL_EXPORT_DIR || '/var/backups/panel/exports', // database exports / import safety dumps on the managed server
     acmeRoot: env.PANEL_ACME_ROOT || '/var/www/letsencrypt',
     allowLocalRepos: bool(env.PANEL_ALLOW_LOCAL_REPOS, false), // file:// repositories (tests only)

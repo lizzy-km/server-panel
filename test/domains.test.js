@@ -533,10 +533,108 @@ test('domains for any kind of app: a port (Node/Java/Docker…), a PHP folder, a
   assert.equal((await st.call('POST', '/api/sites', { domain: 'bad3.test.example', upstream: { type: 'redirect', url: 'https://x.com;}server{' } })).status, 400);
 });
 
+test('folders are inspected to choose the right web root and framework profile', { skip }, async () => {
+  const base = path.join(st.target.dir, 'inspect'); const w = (f, c = 'x') => { fs.mkdirSync(path.dirname(path.join(base, f)), { recursive: true }); fs.writeFileSync(path.join(base, f), c); };
+  w('lv/artisan'); w('lv/public/index.php'); w('lv/.env', 'SECRET=1');
+  w('sf/bin/console'); w('sf/public/index.php');
+  w('wp/wp-config.php'); w('wp/index.php');
+  w('plain/index.php');
+  w('spa/package.json', '{"scripts":{"build":"vite build"}}'); w('spa/dist/index.html');
+  w('nx/package.json', '{"dependencies":{"next":"14.0.0"}}');
+  w('html/index.html');
+  fs.mkdirSync(path.join(base, 'empty'), { recursive: true });
+  const insp = async (d) => (await st.call('POST', '/api/sites/inspect-folder', { path: path.join(base, d) }));
+  let r = await insp('lv'); assert.equal(r.status, 200, r.raw);
+  assert.equal(r.json.kind, 'laravel'); assert.equal(r.json.root, path.join(base, 'lv/public'), 'serves public/, never the app folder with .env'); assert.equal(r.json.mode, 'php');
+  assert.equal((await insp('sf')).json.kind, 'symfony');
+  r = await insp('wp'); assert.equal(r.json.kind, 'wordpress'); assert.equal(r.json.root, path.join(base, 'wp'));
+  assert.equal((await insp('plain')).json.root, path.join(base, 'plain'));
+  r = await insp('spa'); assert.equal(r.json.kind, 'static-spa'); assert.equal(r.json.root, path.join(base, 'spa/dist')); assert.equal(r.json.spa, true); assert.equal(r.json.mode, 'static');
+  r = await insp('nx'); assert.equal(r.json.kind, 'node'); assert.equal(r.json.root, null); assert.match(r.json.note, /port/);
+  assert.equal((await insp('html')).json.kind, 'static-html');
+  assert.equal((await insp('empty')).json.kind, 'unknown');
+  assert.equal((await insp('nope')).json.kind, 'missing');
+  assert.equal((await st.call('POST', '/api/sites/inspect-folder', { path: '/etc/../root' })).status, 400);
+  // the detected framework ends up in the generated nginx config, and nginx accepts it
+  const lv = await st.call('POST', '/api/sites', { domain: 'lv.test.example', upstream: { type: 'php', root: path.join(base, 'lv/public'), framework: 'laravel' } });
+  assert.equal(lv.status, 200, lv.raw);
+  assert.match(readConf('lv.test.example'), /fastcgi_hide_header X-Powered-By;/);
+  const wp = await st.call('POST', '/api/sites', { domain: 'wp.test.example', upstream: { type: 'php', root: path.join(base, 'wp'), framework: 'wordpress' } });
+  assert.equal(wp.status, 200, wp.raw);
+  assert.match(readConf('wp.test.example'), /location = \/wp-config\.php/);
+  assert.equal((await st.call('POST', '/api/sites', { domain: 'bad.test.example', upstream: { type: 'php', root: path.join(base, 'lv'), framework: 'rails' } })).status, 400);
+  const sp = await st.call('POST', '/api/sites', { domain: 'spa.test.example', upstream: { type: 'static', root: path.join(base, 'spa/dist'), spa: true } });
+  assert.equal(sp.status, 200, sp.raw);
+});
+
+test('an app in a different parent folder gets that folder in its nginx config', { skip }, async () => {
+  const parent = path.join(st.target.dir, 'var-www-x'); fs.mkdirSync(parent, { recursive: true });
+  const app = await st.call('POST', '/api/apps', { name: 'webfront', framework: 'static-spa', repoUrl: 'https://github.com/o/r.git', baseDir: parent });
+  assert.equal(app.status, 200, app.raw);
+  const r = await st.call('POST', '/api/sites', { domain: 'web.test.example', upstream: { type: 'app', appId: app.json.app.id } });
+  assert.equal(r.status, 200, r.raw);
+  const conf = readConf('web.test.example');
+  assert.match(conf, new RegExp(`root ${parent}/webfront/live;`));
+  assert.match(conf, /location = \/index\.html/);
+  const next = await st.call('POST', '/api/apps', { name: 'nextapp', framework: 'nextjs', repoUrl: 'https://github.com/o/r.git', port: 4300, baseDir: parent });
+  const r2 = await st.call('POST', '/api/sites', { domain: 'next.test.example', upstream: { type: 'app', appId: next.json.app.id } });
+  assert.equal(r2.status, 200, r2.raw);
+  assert.match(readConf('next.test.example'), /location \/_next\/static\//);
+});
+
+test('the panel warns when the web server user cannot reach the folder', { skip }, async () => {
+  const { execFileSync } = require('child_process');
+  try { execFileSync('id', ['panelwww']); } catch { execFileSync('useradd', ['-M', '-s', '/usr/sbin/nologin', 'panelwww']); }
+  st.app.config.webUser = 'panelwww';
+  try {
+    const locked = path.join(st.target.dir, 'locked'); fs.mkdirSync(path.join(locked, 'site'), { recursive: true }); fs.writeFileSync(path.join(locked, 'site/index.html'), 'x');
+    fs.chmodSync(st.target.dir, 0o755); fs.chmodSync(locked, 0o700); fs.chmodSync(path.join(locked, 'site'), 0o755);
+    const r = await st.call('POST', '/api/sites', { domain: 'locked.test.example', upstream: { type: 'static', root: path.join(locked, 'site') } });
+    assert.equal(r.status, 200, r.raw);
+    assert.equal(r.json.warnings.length, 1, JSON.stringify(r.json.warnings));
+    assert.match(r.json.warnings[0], new RegExp(`cannot enter ${locked}`)); assert.match(r.json.warnings[0], /403 Forbidden/); assert.match(r.json.warnings[0], /chmod o\+x/);
+    fs.chmodSync(locked, 0o755);
+    const up = await st.call('PUT', '/api/sites', { id: r.json.site.id, upstream: { type: 'static', root: path.join(locked, 'site') } });
+    assert.deepEqual(up.json.warnings, [], 'no warning once the folder is reachable');
+    const missing = await st.call('POST', '/api/sites', { domain: 'gone.test.example', upstream: { type: 'static', root: path.join(locked, 'not-yet') } });
+    assert.match(missing.json.warnings[0], /does not exist yet/);
+  } finally { st.app.config.webUser = 'nginx'; }
+});
+
 test('removing a server forgets its apps and domains', { skip }, async () => {
   await st.call('POST', '/api/sites', { domain: 'gone.test.example', upstream: { type: 'url', url: 'http://127.0.0.1:1' } });
   await st.call('POST', '/api/apps', { name: 'gone', repoUrl: 'https://github.com/o/r.git', port: 4200 });
   assert.equal((await st.call('DELETE', `/api/servers?id=${st.serverId}`)).status, 200);
   assert.equal(st.app.store.data.sites.length, 0);
   assert.equal(st.app.store.data.apps.length, 0);
+});
+
+test('renderNginx: each framework gets the locations it needs', () => {
+  const proxy = (fw, extra = {}) => renderNginx(site({ upstream: { type: 'url', url: 'http://127.0.0.1:3000' }, ...extra }), { ...baseCtx, framework: fw });
+  // everything text-based is compressed
+  assert.match(proxy('node'), /gzip on;[\s\S]*gzip_types text\/plain/);
+  // Next.js / Nuxt: fingerprinted build files are cached for a year, the app itself is still proxied
+  const next = proxy('nextjs');
+  assert.match(next, /location \/_next\/static\/ \{[\s\S]*proxy_pass http:\/\/127\.0\.0\.1:3000;[\s\S]*expires 1y;[\s\S]*immutable[\s\S]*\}[\s\S]*location \/ \{/);
+  assert.match(proxy('nuxt'), /location \/_nuxt\/ \{/);
+  assert.ok(!proxy('node').includes('_next'), 'only Next.js');
+  // Spring Boot / .NET: bigger header buffers (large cookies and tokens)
+  assert.match(proxy('spring'), /proxy_buffer_size 16k;/); assert.match(proxy('spring'), /X-Forwarded-Port/);
+  assert.match(proxy('dotnet'), /X-Forwarded-Host \$host;/); assert.match(proxy('dotnet'), /proxy_buffers 8 16k;/);
+  assert.ok(!proxy('go').includes('proxy_buffer_size'));
+  // SPA builds: index.html is never cached, hashed assets are
+  const spa = renderNginx(site({ upstream: { type: 'app', appId: 'x' } }), { ...baseCtx, framework: 'static-spa', upstreamUrl: null, app: { mode: 'static', root: '/var/www/web/live', spa: true } });
+  assert.match(spa, /location = \/index\.html \{\s+add_header Cache-Control "no-cache";/);
+  assert.match(spa, /location ~\* \^\/\(\?:assets\|static\)\/ \{[\s\S]*immutable/);
+  assert.match(spa, /try_files \$uri \/index\.html;/);
+  const plainStatic = renderNginx(site({ upstream: { type: 'app', appId: 'x' } }), { ...baseCtx, framework: 'static-html', upstreamUrl: null, app: { mode: 'static', root: '/var/www/h/live', spa: false } });
+  assert.ok(!plainStatic.includes('no-cache'));
+  // PHP: Laravel hides the PHP version; WordPress also blocks PHP in uploads and its config
+  const php = (fw) => renderNginx(site({ upstream: { type: 'php', root: '/var/www/s', framework: fw } }), { ...baseCtx, framework: fw, upstreamUrl: null, app: { mode: 'php', root: '/var/www/s', fastcgi: 'unix:/run/php-fpm/www.sock' } });
+  assert.match(php('laravel'), /fastcgi_hide_header X-Powered-By;/);
+  assert.ok(!php('laravel').includes('wp-config'));
+  assert.match(php('wordpress'), /location ~\* \/\(\?:uploads\|files\)\/\.\*\\\.php\$ \{\s+deny all;/);
+  assert.match(php('wordpress'), /location = \/wp-config\.php \{\s+deny all;/);
+  // redirects are not compressed or given a root
+  assert.ok(!renderNginx(site({ upstream: { type: 'redirect', url: 'https://x.example' } }), { ...baseCtx, upstreamUrl: null }).includes('gzip'));
 });

@@ -15,6 +15,7 @@ const { DomainManager } = require('./lib/domains');
 const { LaravelManager } = require('./lib/laravel');
 const { DatabaseManager } = require('./lib/databases');
 const { BackupManager } = require('./lib/backups');
+const { SecurityManager } = require('./lib/security');
 const { summarizeFile } = require('./lib/nginxparse');
 const { readBody } = require('./lib/http');
 
@@ -39,11 +40,13 @@ function createApp(overrides = {}) {
   const audit = new AuditLog(path.join(config.dataDir, 'audit.log'));
   const auth = new Auth(store, { sessionHours: config.sessionHours });
   const vault = new Vault(config.dataDir, config.secret);
+  auth.vault = vault;
   const servers = new ServerRegistry({ store, vault, config });
   const deploy = new DeployManager({ store, vault, servers, config });
   const domains = new DomainManager({ store, servers, deploy, config });
   const laravel = new LaravelManager({ store, servers, config });
   const databases = new DatabaseManager({ servers, config });
+  const security = new SecurityManager({ servers, config });
   const backups = new BackupManager({ store, vault, servers, config, databases, deploy });
   // an app's port changed and a deploy has made the new port live: repoint nginx sites that proxy to it
   deploy.onPortChanged = async (app) => {
@@ -92,7 +95,9 @@ function createApp(overrides = {}) {
   route('POST', '/api/login', 'public', async (ctx) => {
     const b = await readJson(ctx.req);
     try {
-      const { user, token } = auth.login(ctx.ip, b.username, b.password);
+      const r = auth.login(ctx.ip, b.username, b.password, b.code);
+      if (r.needs2fa) return { needs2fa: true };
+      const { user, token } = r;
       ctx.setCookie = token;
       audit.write({ user: user.username, ip: ctx.ip, action: 'login' });
       return { user: auth.publicUser(user) };
@@ -106,6 +111,35 @@ function createApp(overrides = {}) {
     auth.destroySession(ctx.token);
     ctx.clearCookie = true;
     note(ctx, 'logout');
+    return { ok: true };
+  });
+
+  // two-step verification (authenticator app)
+  route('POST', '/api/account/2fa/start', 'user', async (ctx) => {
+    const b = await readJson(ctx.req);
+    if (!verifyPassword(String(b.password || ''), ctx.user.hash)) throw httpError(403, 'Password is incorrect');
+    return auth.beginTotp(ctx.user);
+  });
+  route('POST', '/api/account/2fa/enable', 'user', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const recovery = auth.enableTotp(ctx.user, b.code);
+    note(ctx, 'two_step_on');
+    return { recovery };
+  });
+  route('POST', '/api/account/2fa/disable', 'user', async (ctx) => {
+    const b = await readJson(ctx.req);
+    if (!verifyPassword(String(b.password || ''), ctx.user.hash)) throw httpError(403, 'Password is incorrect');
+    if (!auth.verifySecondFactor(ctx.user, b.code)) throw httpError(403, 'Enter a current code or a recovery code to turn it off');
+    auth.disableTotp(ctx.user);
+    note(ctx, 'two_step_off');
+    return { ok: true };
+  });
+  route('POST', '/api/users/2fa/reset', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const u = auth.users.find((x) => x.id === b.id);
+    if (!u) throw httpError(404, 'Unknown user');
+    auth.disableTotp(u); auth.revokeSessions(u.id);
+    note(ctx, 'two_step_reset', u.username);
     return { ok: true };
   });
 
@@ -449,18 +483,19 @@ function createApp(overrides = {}) {
     return { site: domains.publicSite(site) };
   });
   scoped('GET', '/api/sites', 'user', async (ctx) => ({ sites: domains.list(ctx.srv.id, isAdmin(ctx)) }));
+  scoped('POST', '/api/sites/inspect-folder', 'admin', async (ctx) => domains.inspectFolder(ctx.srv.id, (await readJson(ctx.req)).path));
   scoped('POST', '/api/sites', 'admin', async (ctx) => {
     const b = await readJson(ctx.req, 256 * 1024);
     const site = await domains.create(ctx.srv.id, b, ctx.user.username);
     note(ctx, 'site_create', site.domain);
-    return { site: domains.publicSite(site) };
+    return { site: domains.publicSite(site), warnings: await domains.accessWarnings(site).catch(() => []) };
   });
   scoped('PUT', '/api/sites', 'admin', async (ctx) => {
     const b = await readJson(ctx.req, 256 * 1024);
     siteOf(ctx, b.id);
     const site = await domains.update(b.id, b);
     note(ctx, 'site_update', site.domain);
-    return { site: domains.publicSite(site) };
+    return { site: domains.publicSite(site), warnings: await domains.accessWarnings(site).catch(() => []) };
   });
   scoped('DELETE', '/api/sites', 'admin', async (ctx) => {
     const site = siteOf(ctx, q(ctx, 'id'));
@@ -674,6 +709,33 @@ function createApp(overrides = {}) {
     const j = jobOf(ctx, b.id);
     const r = await backups.restore(j.id, b);
     note(ctx, 'backup_restore', `${j.name} ${b.run} ${b.file}${b.inPlace ? ' (in place)' : ''}`);
+    return r;
+  });
+
+  // --- server security tools, admin only ---
+  scoped('GET', '/api/security', 'admin', async (ctx) => security.status(ctx.srv.id));
+  scoped('POST', '/api/security/ssh', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await security.setSsh(ctx.srv.id, b);
+    note(ctx, 'security_ssh', `root=${b.permitRootLogin || 'keep'} password=${b.passwordAuth || 'keep'}`);
+    return r;
+  });
+  scoped('POST', '/api/security/firewall', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await security.firewall(ctx.srv.id, String(b.action), b);
+    note(ctx, 'security_firewall', `${b.action}${b.port ? ` ${b.port}/${b.proto || 'tcp'}` : ''}${b.service ? ` ${b.service}` : ''}`);
+    return r;
+  });
+  scoped('POST', '/api/security/fail2ban', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await security.fail2ban(ctx.srv.id, String(b.action), b);
+    note(ctx, 'security_fail2ban', `${b.action}${b.ip ? ` ${b.ip}` : ''}`);
+    return r;
+  });
+  scoped('POST', '/api/security/auto-updates', 'admin', async (ctx) => {
+    const b = await readJson(ctx.req);
+    const r = await security.autoUpdates(ctx.srv.id, String(b.action), b);
+    note(ctx, 'security_auto_updates', String(b.action));
     return r;
   });
 

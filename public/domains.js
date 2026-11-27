@@ -119,6 +119,27 @@ function discoveryCard(onAdopted) {
   return box;
 }
 
+function showWarnings(list) {
+  if (!list || !list.length) return;
+  modal('Heads up', h('div', {}, ...list.map((w) => h('div', { class: 'alert warn', style: { marginBottom: '8px' } }, w))), { actions: [{ label: 'OK', cls: 'primary', onclick: (c) => c() }] });
+}
+
+/** Look inside the folder: the panel picks the web root, the type (PHP / static) and the framework's nginx settings. */
+function folderChecker(f, field) {
+  const msg = h('div', { class: 'muted', style: { fontSize: '12.5px', margin: '4px 0 10px' } });
+  const btn = h('button', { type: 'button' }, 'Check folder');
+  btn.onclick = act(btn, async () => {
+    msg.textContent = 'Looking inside the folder…';
+    const r = await api('/api/sites/inspect-folder', { method: 'POST', body: { path: f[field].value.trim() } });
+    msg.textContent = r.note;
+    if (!r.root) return;
+    f._framework = ['laravel', 'symfony', 'codeigniter', 'wordpress', 'php'].includes(r.kind) ? r.kind : 'php';
+    if (r.mode === 'php') { f.phpRoot.value = r.root; if (f.type.value !== 'php') { f.type.value = 'php'; f.type.dispatchEvent(new Event('change')); } }
+    else { f.root.value = r.root; f.spa.checked = !!r.spa; if (f.type.value !== 'static') { f.type.value = 'static'; f.type.dispatchEvent(new Event('change')); } }
+  });
+  return h('div', {}, h('div', { class: 'row' }, btn), msg);
+}
+
 /** Pick a port that something on the server is already listening on (Docker containers show up here too). */
 function portPicker(urlInput) {
   const sel = h('select', {}, h('option', { value: '' }, 'Looking for running apps…'));
@@ -157,7 +178,7 @@ function siteForm(site, apps) {
     appId: h('select', {}, apps.length ? apps.map((a) => h('option', { value: a.id, selected: a.id === u.appId }, `${a.name} (${a.mode === 'service' ? `port ${a.port}` : a.mode === 'static' ? 'static website' : 'PHP'})`)) : h('option', { value: '' }, 'No apps on this server')),
     url: h('input', { value: u.url || 'http://127.0.0.1:3000' }),
     root: h('input', { value: u.root || '/var/www/site' }),
-    phpRoot: h('input', { value: u.type === 'php' ? u.root : '/var/www/site/public' }),
+    phpRoot: h('input', { value: u.type === 'php' ? u.root : '/var/www/site' }),
     redirectUrl: h('input', { value: u.url && u.type === 'redirect' ? u.url : 'https://www.example.com' }),
     permanent: h('input', { type: 'checkbox', checked: u.permanent !== false }),
     spa: h('input', { type: 'checkbox', checked: !!u.spa }),
@@ -166,15 +187,16 @@ function siteForm(site, apps) {
     maxBodyMb: h('input', { type: 'number', min: 1, max: 2048, value: s.maxBodyMb || 10 }),
     customConfig: h('textarea', { rows: 6, spellcheck: false, value: s.customConfig || '', placeholder: '# extra nginx directives inside the server block, e.g.\nadd_header X-Frame-Options SAMEORIGIN always;\nlocation /static/ { expires 7d; }' }),
   };
+  f._framework = u.framework;
   const field = (label, el, hint) => h('div', { class: 'field' }, h('label', {}, label), el, hint ? h('div', { class: 'muted', style: { fontSize: '12px' } }, hint) : null);
   const target = h('div', {});
   const sync = () => {
     const t = f.type.value;
     target.replaceChildren(t === 'app' ? field('App', f.appId, 'The panel sets up the right nginx configuration for the app type (reverse proxy, static files or PHP-FPM) and follows it if the app changes.')
       : t === 'url' ? h('div', {}, field('Address of the app', f.url, 'For example http://127.0.0.1:8080. Works for anything that listens on a port: Node, Java, Python, Go, .NET, a Docker container…'), portPicker(f.url))
-        : t === 'php' ? h('div', {}, field('Web folder of the PHP app', f.phpRoot, 'The folder nginx should serve: for Laravel it is the “public” folder inside the app.'), laravelPicker(f.phpRoot))
+        : t === 'php' ? h('div', {}, field('Web folder of the PHP app', f.phpRoot, 'Type the app’s folder (for example /var/www/q-app) and press “Check folder”: the panel finds the right web folder (Laravel’s public/, WordPress, plain PHP) and the matching nginx settings.'), folderChecker(f, 'phpRoot'), laravelPicker(f.phpRoot))
           : t === 'redirect' ? h('div', {}, field('Send visitors to', f.redirectUrl, 'The path they asked for is kept, e.g. old.com/about → https://new.com/about'), h('label', { class: 'row' }, f.permanent, 'Permanent redirect (301). Untick for a temporary one (302).'))
-        : h('div', {}, field('Folder on the server', f.root, 'nginx must be able to read it'), h('label', { class: 'row' }, f.spa, 'Single-page app (serve index.html for unknown paths)')));
+        : h('div', {}, field('Folder on the server', f.root, 'nginx must be able to read it. Press “Check folder” to find the built site inside an app folder.'), folderChecker(f, 'root'), h('label', { class: 'row' }, f.spa, 'Single-page app (serve index.html for unknown paths)')));
   };
   f.type.addEventListener('change', sync); sync();
   const el = h('div', {},
@@ -188,7 +210,7 @@ function siteForm(site, apps) {
     const t = f.type.value;
     const body = {
       aliases: f.aliases.value, forceHttps: f.forceHttps.checked, hsts: f.hsts.checked, maxBodyMb: Number(f.maxBodyMb.value), customConfig: f.customConfig.value,
-      upstream: t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : t === 'php' ? { type: 'php', root: f.phpRoot.value.trim() } : t === 'redirect' ? { type: 'redirect', url: f.redirectUrl.value.trim(), permanent: f.permanent.checked } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
+      upstream: t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : t === 'php' ? { type: 'php', root: f.phpRoot.value.trim(), framework: f._framework || 'php' } : t === 'redirect' ? { type: 'redirect', url: f.redirectUrl.value.trim(), permanent: f.permanent.checked } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
     };
     if (!site) body.domain = f.domain.value.trim();
     return body;
@@ -226,7 +248,7 @@ function pageDomains() {
     const close = modal('Add domain', h('div', {}, err, form.el, h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Cancel'), create)), { wide: true });
     create.onclick = act(create, async () => {
       err.classList.add('hidden');
-      try { const r = await api('/api/sites', { method: 'POST', body: form.read() }); close(); toast(`${r.site.domain} added and nginx reloaded`); location.hash = `#/domains/${r.site.id}`; }
+      try { const r = await api('/api/sites', { method: 'POST', body: form.read() }); close(); showWarnings(r.warnings); toast(`${r.site.domain} added and nginx reloaded`); location.hash = `#/domains/${r.site.id}`; }
       catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
   };
@@ -390,7 +412,7 @@ function pageDomainDetail(id) {
     const save = h('button', { class: 'primary' }, 'Save & apply');
     save.onclick = act(save, async () => {
       err.classList.add('hidden');
-      try { await api('/api/sites', { method: 'PUT', body: { id, ...form.read() } }); toast('Saved. nginx reloaded.'); await load(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+      try { const sv = await api('/api/sites', { method: 'PUT', body: { id, ...form.read() } }); showWarnings(sv.warnings); toast('Saved. nginx reloaded.'); await load(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
     const generated = { text: '' };
     const right = h('div', { class: 'card' });

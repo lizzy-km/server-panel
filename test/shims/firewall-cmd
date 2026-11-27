@@ -1,0 +1,14 @@
+#!/bin/bash
+STATE="${SHIM_STATE:?}"; F="$STATE/fw"; mkdir -p "$F"; touch "$F/ports" "$F/services"
+running() { [ -f "$STATE/firewalld.active" ]; }
+for a in "$@"; do case "$a" in
+  --state) if running; then echo running; exit 0; else echo "not running"; exit 252; fi;;
+  --list-ports) running || { echo "FirewallD is not running" >&2; exit 252; }; tr '\n' ' ' < "$F/ports"; echo; exit 0;;
+  --list-services) running || { echo "FirewallD is not running" >&2; exit 252; }; tr '\n' ' ' < "$F/services"; echo; exit 0;;
+  --add-port=*) echo "${a#--add-port=}" >> "$F/ports"; sort -u -o "$F/ports" "$F/ports";;
+  --remove-port=*) grep -vx "${a#--remove-port=}" "$F/ports" > "$F/p2"; mv "$F/p2" "$F/ports";;
+  --add-service=*) echo "${a#--add-service=}" >> "$F/services"; sort -u -o "$F/services" "$F/services";;
+  --remove-service=*) grep -vx "${a#--remove-service=}" "$F/services" > "$F/s2"; mv "$F/s2" "$F/services";;
+  --reload) echo reload >> "$STATE/fw.reloads";;
+esac; done
+echo success; exit 0

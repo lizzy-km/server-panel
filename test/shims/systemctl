@@ -4,14 +4,17 @@ cmd="$1"; shift
 quiet=0; args=()
 for a in "$@"; do case "$a" in --quiet|-q) quiet=1;; --no-pager|--no-legend|--plain) ;; *) args+=("$a");; esac; done
 unit="${args[${#args[@]}-1]}"
+simple() { [ "$1" = nginx ] || [[ "$1" == *.timer ]] || [ "$1" = firewalld ] || [ "$1" = fail2ban ]; }
 active() { [ -f "$STATE/$1.pid" ] && kill -0 "$(cat "$STATE/$1.pid")" 2>/dev/null; }
 # like systemd (KillMode=control-group): signal the whole process group, not just the top process
 stop_unit() { if [ -f "$STATE/$1.pid" ]; then p=$(cat "$STATE/$1.pid"); kill -TERM -- "-$p" 2>/dev/null || kill "$p" 2>/dev/null; sleep 0.3; kill -KILL -- "-$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; rm -f "$STATE/$1.pid"; fi; }
 case "$cmd" in
-  daemon-reload|enable|disable|reset-failed) exit 0;;
-  is-enabled) echo enabled;;
+  daemon-reload|reset-failed) exit 0;;
+  enable) touch "$STATE/$unit.enabled"; exit 0;;
+  disable) rm -f "$STATE/$unit.enabled"; exit 0;;
+  is-enabled) case "$unit" in dnf-automatic.timer|firewalld|fail2ban) if [ -f "$STATE/$unit.enabled" ]; then echo enabled; else echo disabled; exit 1; fi;; *) echo enabled;; esac;;
   is-active)
-    if [ "$unit" = nginx ] || [[ "$unit" == *.timer ]]; then
+    if simple "$unit"; then
       if [ -f "$STATE/$unit.active" ]; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi
     fi
     if active "$unit"; then [ $quiet = 1 ] || echo active; exit 0; else [ $quiet = 1 ] || echo inactive; exit 3; fi;;
@@ -22,12 +25,13 @@ case "$cmd" in
       *MemoryCurrent*) echo 12345678;;
       *NRestarts*) echo 0;;
     esac;;
-  stop) case "$unit" in *.timer) rm -f "$STATE/$unit.active"; exit 0;; esac; stop_unit "$unit"; rm -f "$STATE/$unit.active";;
+  stop) case "$unit" in *.timer|firewalld|fail2ban) rm -f "$STATE/$unit.active"; exit 0;; esac; stop_unit "$unit"; rm -f "$STATE/$unit.active";;
   reload)
+    case "$unit" in sshd|ssh) echo "reload $unit" >> "$STATE/sshd.reloads"; exit 0;; esac
     echo "reload $unit" >> "$STATE/reloads.log"
     if [ "$unit" = nginx ]; then echo x >> "$STATE/nginx.reloads"; [ -f "$STATE/nginx.active" ] || exit 1; exit 0; fi; exit 0;;
   start|restart)
-    if [ "$unit" = nginx ] || [[ "$unit" == *.timer ]]; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi
+    if simple "$unit"; then touch "$STATE/$unit.active"; echo x >> "$STATE/$unit.reloads"; exit 0; fi
     f="$UNIT_DIR/$unit"; [ -f "$f" ] || { echo "Unit $unit not found." >&2; exit 5; }
     stop_unit "$unit"
     wd=$(sed -n 's/^WorkingDirectory=//p' "$f"); envf=$(sed -n 's/^EnvironmentFile=-\{0,1\}//p' "$f"); ex=$(sed -n 's/^ExecStart=//p' "$f")

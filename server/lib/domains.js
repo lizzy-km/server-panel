@@ -52,7 +52,9 @@ function cleanSite(input, { partial = false } = {}) {
     } else if (u.type === 'php') {
       const root = String(u.root || '').trim().replace(/\/+$/, '');
       if (!ROOT_RE.test(root) || root.includes('..')) throw httpError(400, 'PHP folder must be an absolute path such as /var/www/site/public (for Laravel: the public folder)');
-      out.upstream = { type: 'php', root };
+      const fw = String(u.framework || 'php');
+      if (!['php', 'laravel', 'symfony', 'codeigniter', 'wordpress'].includes(fw)) throw httpError(400, 'Unknown PHP framework');
+      out.upstream = { type: 'php', root, framework: fw };
     } else if (u.type === 'redirect') {
       const url = String(u.url || '').trim().replace(/\/+$/, '');
       if (!URL_RE.test(url)) throw httpError(400, 'Redirect target must look like https://www.example.com');
@@ -79,7 +81,16 @@ function cleanSite(input, { partial = false } = {}) {
   return out;
 }
 
-/** Pure function: nginx configuration for one site. */
+const GZIP = `    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 1024;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml;
+`;
+const IMMUTABLE = 'expires 1y;\n        add_header Cache-Control "public, immutable";';
+
+/** Pure function: nginx configuration for one site. The framework (of the app, or detected from the folder) shapes the locations. */
 function renderNginx(site, ctx) {
   const names = [site.domain, ...(site.aliases || [])].join(' ');
   const tls = !!(ctx.tlsActive && site.tls);
@@ -88,9 +99,12 @@ function renderNginx(site, ctx) {
   const up = site.upstream;
   const app = ctx.app && (ctx.app.mode === 'static' || ctx.app.mode === 'php') ? ctx.app : null;
   const redirect = up.type === 'redirect' ? `    location / {\n        return ${up.permanent === false ? 302 : 301} ${up.url}$request_uri;\n    }` : null; // {mode, root, spa, fastcgi}
-  const body = up.type === 'static'
-    ? `        root ${up.root};\n        index index.html;\n        try_files $uri ${up.spa ? '/index.html' : '$uri/ =404'};`
-    : `        proxy_pass ${ctx.upstreamUrl};
+  const fw = ctx.framework || '';
+  // what the framework needs from the proxy
+  const proxyExtra = { spring: ['proxy_buffer_size 16k;', 'proxy_buffers 8 16k;', 'proxy_busy_buffers_size 32k;', 'proxy_set_header X-Forwarded-Port $server_port;'],
+    dotnet: ['proxy_buffer_size 16k;', 'proxy_buffers 8 16k;', 'proxy_busy_buffers_size 32k;', 'proxy_set_header X-Forwarded-Host $host;'],
+    python: ['proxy_set_header X-Forwarded-Host $host;'] }[fw] || [];
+  const proxyBlock = (extra = '') => `        proxy_pass ${ctx.upstreamUrl};
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -98,13 +112,19 @@ function renderNginx(site, ctx) {
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
-        proxy_read_timeout 120s;`;
+        proxy_read_timeout 120s;${proxyExtra.map((l) => `\n        ${l}`).join('')}${extra}`;
+  // Next.js and Nuxt fingerprint their build files: let browsers keep them for a year
+  const hashed = { nextjs: '/_next/static/', nuxt: '/_nuxt/' }[fw];
+  const hashedLocation = hashed && up.type !== 'static' && up.type !== 'redirect' ? `    location ${hashed} {\n${proxyBlock(`\n        ${IMMUTABLE}`)}\n    }\n` : '';
+  const body = up.type === 'static'
+    ? `        root ${up.root};\n        index index.html;\n        try_files $uri ${up.spa ? '/index.html' : '$uri/ =404'};`
+    : proxyBlock();
   const custom = (site.customConfig || '').trim()
     ? `\n    # ---- custom configuration ----\n${site.customConfig.trim().split('\n').map((l) => '    ' + l).join('\n')}\n`
     : '';
   const rootLines = app ? `    root ${app.root};\n    index ${app.mode === 'php' ? 'index.php index.html' : 'index.html'};\n` : '';
   const common = `    server_name ${names};
-${rootLines}    client_max_body_size ${site.maxBodyMb || 10}m;
+${rootLines}${up.type === 'redirect' ? '' : GZIP}    client_max_body_size ${site.maxBodyMb || 10}m;
     access_log ${ctx.logDir}/${site.domain}.access.log;
     error_log ${ctx.logDir}/${site.domain}.error.log;
 ${custom}`;
@@ -112,6 +132,14 @@ ${custom}`;
         root ${ctx.acmeRoot};
         default_type "text/plain";
     }`;
+  // PHP: hide the PHP version everywhere; WordPress: never run PHP from upload folders, protect its config
+  const phpExtras = fw === 'wordpress' ? `
+    location ~* /(?:uploads|files)/.*\\.php$ {
+        deny all;
+    }
+    location = /wp-config.php {
+        deny all;
+    }` : '';
   const appLocations = !app ? null : app.mode === 'php'
     ? `    location / {
         try_files $uri $uri/ /index.php?$query_string;
@@ -121,20 +149,28 @@ ${custom}`;
         fastcgi_index index.php;
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         include fastcgi_params;
+        fastcgi_hide_header X-Powered-By;
         fastcgi_read_timeout 120s;
     }
     location ~ /\\.(?!well-known) {
         deny all;
-    }`
+    }${phpExtras}`
     : `    location / {
         try_files $uri ${app.spa ? '/index.html' : '$uri/ =404'};
+    }${app.spa ? `
+    location = /index.html {
+        add_header Cache-Control "no-cache";
     }
+    location ~* ^/(?:assets|static)/ {
+        ${IMMUTABLE}
+        try_files $uri =404;
+    }` : ''}
     location ~* \\.(?:css|js|mjs|woff2?|ttf|svg|png|jpe?g|gif|webp|ico)$ {
         expires 7d;
         add_header Cache-Control "public";
         try_files $uri =404;
     }`;
-  const proxyLocation = redirect || appLocations || `    location / {\n${body}\n    }`;
+  const proxyLocation = redirect || appLocations || `${hashedLocation}    location / {\n${body}\n    }`;
 
   let out = `# Managed by Server Panel (site ${site.id}). Edit it in the panel; manual changes are overwritten.\n`;
   if (!tls) {
@@ -198,6 +234,15 @@ class DomainManager {
     return null;
   }
 
+  /** The framework that shapes this site's nginx locations: the app's own, or what was detected in the folder. */
+  frameworkOf(site) {
+    const u = site.upstream || {};
+    if (u.type === 'app') { const app = this.deploy.apps.find((a) => a.id === u.appId); return app ? (app.framework || 'node') : ''; }
+    if (u.type === 'php') return u.framework || 'php';
+    if (u.type === 'static') return 'static-html';
+    return '';
+  }
+
   /** For apps that nginx serves directly (static builds, PHP): where the files are and how to serve them. */
   appCtx(site) {
     if (site.upstream && site.upstream.type === 'php') return { mode: 'php', root: site.upstream.root, fastcgi: this.config.phpSocket };
@@ -206,6 +251,77 @@ class DomainManager {
     if (!app) return null;
     const cfg = P.resolve(app);
     return cfg.mode === 'service' ? null : { mode: cfg.mode, root: `${this.deploy.appDir(app)}/live`, spa: cfg.spa, fastcgi: this.config.phpSocket };
+  }
+
+  // ------------------------------------------------------------------ folders: what is in it, and can nginx read it?
+
+  /** Look inside an app folder and say how nginx should serve it (the "parent folder" is what people know; the web root is inside it). */
+  async inspectFolder(serverId, folder) {
+    const dir = String(folder || '').trim().replace(/\/+$/, '');
+    if (!ROOT_RE.test(dir) || dir.includes('..')) throw httpError(400, 'Enter the absolute folder of the app, e.g. /var/www/q-app');
+    const host = this.servers.entry(serverId).host;
+    const script = `USE_SUDO=${host.useSudo ? 1 : 0}
+priv() { if [ "$USE_SUDO" = 1 ] && [ "$(id -u)" != 0 ]; then sudo -n "$@"; else "$@"; fi; }
+D=${shq(dir)}
+has() { priv test -e "$D/$1"; }
+[ -d "$D" ] || priv test -d "$D" || { echo "kind=missing"; exit 0; }
+if has artisan && has public/index.php; then echo "kind=laravel"; echo "root=$D/public"
+elif has bin/console && has public/index.php; then echo "kind=symfony"; echo "root=$D/public"
+elif has spark && has public/index.php; then echo "kind=codeigniter"; echo "root=$D/public"
+elif has wp-config.php || has wp-includes; then echo "kind=wordpress"; echo "root=$D"
+elif has public/index.php; then echo "kind=php"; echo "root=$D/public"
+elif has index.php; then echo "kind=php"; echo "root=$D"
+elif has package.json; then
+  PKG=$(priv cat "$D/package.json" 2>/dev/null | tr -d '\\n' | head -c 20000)
+  for o in dist build out public; do if has "$o/index.html"; then echo "kind=static-spa"; echo "root=$D/$o"; break; fi; done
+  echo "node=$(printf '%s' "$PKG" | grep -oE '"(next|nuxt|@nestjs/core|express|fastify|koa)"' | head -1 | tr -d '"')"
+  echo "kind_fallback=node"
+elif has index.html; then echo "kind=static-html"; echo "root=$D"
+else echo "kind=unknown"; fi
+`;
+    const r = await host.run('bash', ['-s'], { stdin: script, timeout: 30000 });
+    const o = {};
+    for (const line of r.stdout.split('\n')) { const i = line.indexOf('='); if (i > 0) o[line.slice(0, i)] = line.slice(i + 1).trim(); }
+    const labels = { laravel: 'Laravel', symfony: 'Symfony', codeigniter: 'CodeIgniter', wordpress: 'WordPress', php: 'PHP', 'static-spa': 'a built front-end (React / Vue / Angular / Vite)', 'static-html': 'a plain HTML site' };
+    let kind = o.kind || 'unknown';
+    if (kind === 'unknown' && o.kind_fallback === 'node') kind = 'node';
+    if (kind === 'node') {
+      return { kind: 'node', label: 'a Node.js app', root: null, mode: 'proxy', note: `This folder holds a Node.js app${o.node ? ` (${o.node})` : ''} that runs a server on its own port. Choose “Any app running on a port” and pick its port, or deploy it with the panel.` };
+    }
+    if (kind === 'missing') return { kind, label: '', root: null, mode: null, note: 'That folder does not exist on this server.' };
+    if (kind === 'unknown') return { kind, label: '', root: null, mode: null, note: 'Nothing recognisable here (no index.php, artisan, package.json or index.html).' };
+    const php = ['laravel', 'symfony', 'codeigniter', 'wordpress', 'php'].includes(kind);
+    return { kind, label: labels[kind], root: o.root, mode: php ? 'php' : 'static', spa: kind === 'static-spa', note: `Detected ${labels[kind]}: nginx will serve ${o.root}${php && o.root !== dir ? ' (the public folder inside your app, so source code and .env are never exposed)' : ''}.` };
+  }
+
+  /** Can the nginx user actually reach a folder? A parent folder it cannot enter is the classic cause of 403 errors. */
+  async accessWarnings(site) {
+    const u = site.upstream || {};
+    let root = null;
+    if (u.type === 'php' || u.type === 'static') root = u.root;
+    else if (u.type === 'app') { const c = this.appCtx(site); root = c ? c.root : null; }
+    if (!root) return [];
+    const host = this.servers.entry(site.serverId).host;
+    const user = this.config.webUser;
+    const script = `USE_SUDO=${host.useSudo ? 1 : 0}
+priv() { if [ "$USE_SUDO" = 1 ] && [ "$(id -u)" != 0 ]; then sudo -n "$@"; else "$@"; fi; }
+id ${shq(user)} >/dev/null 2>&1 || exit 0
+P=""
+for part in $(printf '%s' ${shq(root)} | tr '/' ' '); do
+  P="$P/$part"
+  [ -e "$P" ] || { echo "missing:$P"; break; }
+  if [ "$P" = ${shq(root)} ]; then priv sudo -n -u ${shq(user)} test -r "$P" 2>/dev/null || echo "read:$P"; else priv sudo -n -u ${shq(user)} test -x "$P" 2>/dev/null || echo "enter:$P"; fi
+done
+`;
+    const r = await host.run('bash', ['-s'], { stdin: script, timeout: 30000 });
+    const out = [];
+    for (const line of r.stdout.split('\n')) {
+      const m = line.match(/^(missing|read|enter):(.+)$/); if (!m) continue;
+      out.push(m[1] === 'missing' ? `${m[2]} does not exist yet (nginx will answer 404/403 until the app is deployed there).`
+        : `The web server user (${user}) cannot ${m[1] === 'enter' ? 'enter' : 'read'} ${m[2]}, so visitors will get “403 Forbidden”. Fix the folder permissions (for example: chmod o+x ${m[2]}).`);
+      if (m[1] !== 'missing') break;
+    }
+    return out;
   }
 
   validateOwnership(serverId, v, selfId) {
@@ -267,7 +383,7 @@ class DomainManager {
     if (!version) throw httpError(400, 'nginx is not installed on this server (Deploy → Prepare server)');
     const http2 = version[0] > 1 || (version[0] === 1 && (version[1] > 25 || (version[1] === 25 && version[2] >= 1))) ? 'directive' : 'listen';
     const conf = site.rawConfig ? site.rawConfig : renderNginx(site, {
-      ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir,
+      ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), framework: this.frameworkOf(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir,
       acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2,
     });
     const p = this.confPath(site);
@@ -296,7 +412,7 @@ class DomainManager {
     const host = this.servers.entry(site.serverId).host;
     const version = (await this.nginxVersion(host).catch(() => null)) || [1, 28, 0];
     const http2 = version[0] > 1 || version[1] > 25 || (version[1] === 25 && version[2] >= 1) ? 'directive' : 'listen';
-    return renderNginx(site, { ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir, acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2 });
+    return renderNginx(site, { ipv6: await this.hasIpv6(host), upstreamUrl: this.upstreamUrl(site), app: this.appCtx(site), framework: this.frameworkOf(site), tlsActive: !!site.tls, letsencryptDir: this.config.letsencryptDir, acmeRoot: this.config.acmeRoot, logDir: this.config.nginxLogDir, http2 });
   }
 
   // ------------------------------------------------------------------ editing nginx files directly

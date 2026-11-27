@@ -82,7 +82,10 @@ async function makeTarget() {
     le: path.join(dir, 'letsencrypt'), acme: path.join(dir, 'acme'), tmp: path.join(dir, 'nginx/tmp'),
   };
   for (const d of [bin, state, ...Object.values(dirs)]) fs.mkdirSync(d, { recursive: true });
-  for (const name of ['systemctl', 'journalctl', 'certbot', 'aws']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(bin, name)), fs.chmodSync(path.join(bin, name), 0o755);
+  for (const name of ['systemctl', 'journalctl', 'certbot', 'aws', 'sshd', 'dnf']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(bin, name)), fs.chmodSync(path.join(bin, name), 0o755);
+  // these only appear after the fake `dnf install`, like the real packages
+  const avail = path.join(dir, 'avail'); fs.mkdirSync(avail, { recursive: true });
+  for (const name of ['firewall-cmd', 'fail2ban-client']) fs.copyFileSync(path.join(__dirname, 'shims', name), path.join(avail, name)), fs.chmodSync(path.join(avail, name), 0o755);
   const nginxConf = path.join(dir, 'nginx/nginx.conf');
   fs.writeFileSync(nginxConf, `pid ${dir}/nginx/nginx.pid;\nerror_log ${dirs.logs}/error.log;\nevents { worker_connections 16; }\nhttp {\n  access_log off;\n  client_body_temp_path ${dirs.tmp}/b; proxy_temp_path ${dirs.tmp}/p; fastcgi_temp_path ${dirs.tmp}/f; uwsgi_temp_path ${dirs.tmp}/u; scgi_temp_path ${dirs.tmp}/s;\n  include ${dirs.conf}/*.conf;\n}\n`);
   // `include fastcgi_params;` is resolved relative to the test nginx.conf
@@ -90,12 +93,12 @@ async function makeTarget() {
   const key = genKey(dir, 'id_ed25519');
   const sshd = await startSshd({
     authorizedKeys: [key.pub],
-    env: { PATH: `${bin}:${process.env.PATH}:/usr/sbin:/sbin`, SHIM_STATE: state, SHIM_UNIT_DIR: dirs.units },
+    env: { PATH: `${bin}:${process.env.PATH}:/usr/sbin:/sbin`, SHIM_STATE: state, SHIM_UNIT_DIR: dirs.units, SHIM_BIN: bin, SHIM_AVAIL: avail },
   });
   const overrides = {
     appsBaseDir: dirs.apps, unitDir: dirs.units, nginxConfDir: dirs.conf, nginxLogDir: dirs.logs, nginxConf,
     letsencryptDir: dirs.le, acmeRoot: dirs.acme, allowLocalRepos: true, phpSocket: `unix:${dir}/php-fpm.sock`,
-    exportDir: path.join(dir, 'exports'), backupRoot: path.join(dir, 'backups'), backupScriptDir: path.join(dir, 'backup-scripts'),
+    exportDir: path.join(dir, 'exports'), sshdDropinDir: path.join(state, 'sshd.d'), fail2banJailDir: path.join(state, 'jail.d'), dnfAutomaticConf: path.join(state, 'automatic.conf'), sshRollbackSeconds: 3, backupRoot: path.join(dir, 'backups'), backupScriptDir: path.join(dir, 'backup-scripts'),
   };
   return { dir, dirs, state, key, sshd, overrides, stop() { sshd.stop(); try { for (const f of fs.readdirSync(state)) if (f.endsWith('.pid')) { try { process.kill(Number(fs.readFileSync(path.join(state, f), 'utf8')), 'SIGKILL'); } catch { /* gone */ } } } catch { /* ignore */ } fs.rmSync(dir, { recursive: true, force: true }); } };
 }

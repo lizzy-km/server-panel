@@ -127,6 +127,22 @@ Requirements on the managed server: the SSH user needs **passwordless sudo** (de
 
 Apps can be placed in `/var/www`, `/srv/apps` or any other folder when you create them; a folder that already contains files the panel did not create is never deployed into.
 
+## Security
+
+**Security** gives a checkup with one-click fixes: SSH settings, firewall, fail2ban, automatic security updates, risky accounts and the last 24 hours of failed logins.
+
+- **SSH hardening** (turn off root login / password login) is written to one separate file, checked with `sshd -t`, verified with `sshd -T`, and then the panel opens a brand-new connection to prove it still works. If that fails, **the server undoes the change by itself** after a short delay, so a mistake cannot lock you out. The panel refuses to disable root login when it connects as root, or password login when the user has no key.
+- **Firewall** (firewalld): SSH and the panel's own connection port are opened *before* the firewall starts and can never be closed from the panel. Open or close ports and services with buttons.
+- **fail2ban** blocks addresses after repeated failed SSH logins; the panel's own address is whitelisted. (Amazon Linux 2023 may not ship fail2ban; the panel says so clearly if the package is missing.)
+- **Automatic security updates** via dnf-automatic (security updates only).
+- **Two-step verification** for panel accounts (authenticator app, recovery codes) under your account menu; admins can reset a user's second step on the Users page.
+
+Remember that on AWS the instance's Security Group is the first firewall: keep it in sync with what you open here.
+
+## nginx and frameworks
+
+The nginx configuration follows the app: its framework and the folder it lives in (`/var/www`, `/srv/apps`, anything). Next.js and Nuxt fingerprinted build files are cached for a year; React/Vue/Angular builds never cache `index.html`; Spring Boot and .NET get larger proxy buffers and forwarded-host headers; Laravel hides the PHP version; WordPress blocks PHP in uploads. For existing folders, **Check folder** looks inside and picks the right web root (Laravel's `public/`, a build's `dist/`, WordPress, plain PHP) and tells you if it is a Node app that needs a port instead. After saving, the panel warns if the nginx user cannot enter a parent folder (the usual cause of 403 errors).
+
 ## Install the panel on Amazon Linux 2023
 
 ```bash

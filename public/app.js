@@ -222,6 +222,7 @@ const NAV = [
   { id: 'domains', label: 'Domains', icon: '⌂', page: () => pageDomains() },
   { id: 'databases', label: 'Databases', icon: '▥', admin: true, page: () => pageDatabases() },
   { id: 'backups', label: 'Backups', icon: '⛁', admin: true, page: () => pageBackups() },
+  { id: 'security', label: 'Security', icon: '🛡', admin: true, page: () => pageSecurity() },
   { id: 'docker', label: 'Docker', icon: '▣', page: () => pageDocker() },
   { id: 'network', label: 'Network', icon: '⇄', page: () => pageNetwork() },
   { sep: true, admin: true },
@@ -299,18 +300,21 @@ function authScreen(setup) {
   const fromUrl = (location.hash.match(/^#setup=([A-Za-z0-9]+)$/) || [])[1] || '';
   const token = setup ? h('input', { id: 't', autocomplete: 'off', required: true, value: fromUrl, placeholder: 'Printed in the server console' }) : null;
   if (fromUrl) history.replaceState(null, '', location.pathname); // the token is single use; do not leave it in the address bar
+  const code = h('input', { id: 'c', autocomplete: 'one-time-code', inputmode: 'text', placeholder: '123456 or a recovery code' });
+  const codeBox = h('div', { class: 'field hidden' }, h('label', { for: 'c' }, 'Code from your authenticator app'), code);
   const btn = h('button', { class: 'primary', type: 'submit' }, setup ? 'Create admin account' : 'Sign in');
   const form = h('form', {
     onsubmit: async (e) => {
       e.preventDefault(); err.textContent = ''; btn.disabled = true;
       try {
-        const r = await api(setup ? '/api/setup' : '/api/login', { method: 'POST', body: { username: user.value, password: pass.value, setupToken: token && token.value } });
+        const r = await api(setup ? '/api/setup' : '/api/login', { method: 'POST', body: { username: user.value, password: pass.value, setupToken: token && token.value, code: code.value.trim() || undefined } });
+        if (r.needs2fa) { codeBox.classList.remove('hidden'); code.focus(); btn.disabled = false; err.textContent = 'Enter the 6-digit code from your authenticator app.'; return; }
         state.user = r.user; state.setupRequired = false; await loadServers(); render();
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
     },
   },
     h('div', { class: 'field' }, h('label', { for: 'u' }, 'Username'), user),
-    h('div', { class: 'field' }, h('label', { for: 'p' }, 'Password'), pass),
+    h('div', { class: 'field' }, h('label', { for: 'p' }, 'Password'), pass), codeBox,
     token ? (fromUrl ? h('div', { class: 'muted', style: { fontSize: '12.5px', marginBottom: '10px' } }, '✓ Setup token filled in automatically.') : h('div', { class: 'field' }, h('label', { for: 't' }, 'Setup token'), token)) : null,
     err, btn);
   return h('div', { class: 'auth' }, h('div', { class: 'card' },
@@ -318,12 +322,49 @@ function authScreen(setup) {
     h('p', { class: 'muted' }, setup ? 'Create the first administrator. Use at least 10 characters.' : 'Sign in to continue.'), form));
 }
 
+function twoStepSection() {
+  const box = h('div', { style: { marginTop: '16px', paddingTop: '12px', borderTop: '1px solid var(--border, #ddd)' } });
+  const paint = () => {
+    const on = state.user.totp;
+    const btn = h('button', { class: on ? 'danger' : 'primary' }, on ? 'Turn off two-step verification' : 'Set up two-step verification');
+    btn.onclick = on ? twoStepOff : twoStepSetup;
+    box.replaceChildren(h('h3', { style: { margin: '0 0 6px' } }, 'Two-step verification'),
+      h('p', { class: 'muted', style: { fontSize: '12.5px', margin: '0 0 8px' } }, on ? 'On: signing in needs a code from your authenticator app as well as your password.' : 'Adds a code from an authenticator app (Google Authenticator, Authy, 1Password…) to sign-in, so a stolen password alone is not enough.'), btn);
+  };
+  async function twoStepSetup() {
+    const pw = await promptDialog('Confirm your password', 'Password', '', { type: 'password' }); if (!pw) return;
+    let st; try { st = await api('/api/account/2fa/start', { method: 'POST', body: { password: pw } }); } catch (e) { return fail(e); }
+    const code = h('input', { autocomplete: 'one-time-code', inputmode: 'numeric', placeholder: '123456' });
+    const spaced = st.secret.match(/.{1,4}/g).join(' ');
+    const close = modal('Set up two-step verification', h('div', {},
+      h('p', {}, '1. In your authenticator app choose “add account” → “enter a setup key” and type this key (account: ', h('strong', {}, state.user.username), '):'),
+      copyRow(st.secret, 'Setup key'), h('p', { class: 'muted', style: { fontSize: '12px' } }, `Shown in groups: ${spaced}. Time-based, 6 digits.`),
+      h('p', {}, '2. Enter the 6-digit code the app shows now:'), h('div', { class: 'field' }, code)), {
+      actions: [{ label: 'Cancel', onclick: (c) => c() }, { label: 'Turn on', cls: 'primary', onclick: async (c) => {
+        try {
+          const r = await api('/api/account/2fa/enable', { method: 'POST', body: { code: code.value } });
+          state.user.totp = true; c(); paint();
+          modal('Save your recovery codes', h('div', {}, h('p', {}, 'If you lose your phone, each of these codes lets you sign in once. They are shown only now: store them somewhere safe.'), h('pre', { class: 'out' }, r.recovery.join('\n'))), { actions: [{ label: 'I saved them', cls: 'primary', onclick: (cc) => cc() }] });
+        } catch (e) { fail(e); }
+      } }],
+    });
+    void close;
+  }
+  async function twoStepOff() {
+    const pw = await promptDialog('Confirm your password', 'Password', '', { type: 'password' }); if (!pw) return;
+    const code = await promptDialog('Code', 'Current code from the app, or a recovery code'); if (!code) return;
+    try { await api('/api/account/2fa/disable', { method: 'POST', body: { password: pw, code } }); state.user.totp = false; toast('Two-step verification is off'); paint(); } catch (e) { fail(e); }
+  }
+  paint();
+  return box;
+}
+
 function accountDialog() {
   const cur = h('input', { type: 'password', autocomplete: 'current-password' });
   const nw = h('input', { type: 'password', autocomplete: 'new-password' });
   modal('Change password', h('div', {},
     h('div', { class: 'field' }, h('label', {}, 'Current password'), cur),
-    h('div', { class: 'field' }, h('label', {}, 'New password (min 10 characters)'), nw)), {
+    h('div', { class: 'field' }, h('label', {}, 'New password (min 10 characters)'), nw), twoStepSection()), {
     actions: [{ label: 'Cancel', onclick: (c) => c() }, {
       label: 'Change', cls: 'primary',
       onclick: async (c) => { try { await api('/api/account/password', { method: 'POST', body: { current: cur.value, password: nw.value } }); toast('Password changed'); c(); } catch (e) { fail(e); } },
@@ -955,10 +996,11 @@ function pageUsers() {
   async function load() {
     const r = await api('/api/users');
     box.replaceChildren(dataTable({
-      columns: [{ key: 'username', label: 'Username' }, { key: 'role', label: 'Role', render: (u) => h('span', { class: 'badge ' + (u.role === 'admin' ? 'warn' : '') }, u.role) }, { key: 'created', label: 'Created', render: (u) => fmt.date(Date.parse(u.created)) }],
+      columns: [{ key: 'username', label: 'Username' }, { key: 'role', label: 'Role', render: (u) => h('span', { class: 'badge ' + (u.role === 'admin' ? 'warn' : '') }, u.role) }, { key: 'totp', label: '2-step', render: (u) => (u.totp ? h('span', { class: 'badge ok' }, 'on') : h('span', { class: 'muted' }, 'off')) }, { key: 'created', label: 'Created', render: (u) => fmt.date(Date.parse(u.created)) }],
       rows: r.users,
       rowActions: (u) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
         h('button', { class: 'sm', onclick: async () => { const pw = await promptDialog(`New password for ${u.username}`, 'At least 10 characters', '', { type: 'password' }); if (pw) try { await api('/api/users/password', { method: 'POST', body: { id: u.id, password: pw } }); toast('Password updated'); } catch (e) { fail(e); } } }, 'Reset password'),
+        u.totp ? h('button', { class: 'sm', onclick: async () => { if (await confirmDialog('Turn off two-step verification?', `${u.username} will sign in with the password only until they set it up again, and is signed out everywhere.`, 'Turn off')) try { await api('/api/users/2fa/reset', { method: 'POST', body: { id: u.id } }); toast('Two-step verification reset'); load(); } catch (e) { fail(e); } } }, 'Reset 2-step') : null,
         u.id === state.user.id ? null : h('button', { class: 'sm danger', onclick: async () => { if (await confirmDialog('Delete user?', u.username, 'Delete')) try { await api('/api/users?id=' + encodeURIComponent(u.id), { method: 'DELETE' }); load(); } catch (e) { fail(e); } } }, 'Delete')),
     }));
   }
