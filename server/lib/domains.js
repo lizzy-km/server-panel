@@ -388,6 +388,11 @@ done
     });
     const p = this.confPath(site);
     const prev = await this.readFile(host, p);
+    // the first time the panel generates over a hand-written file, keep the original (outside conf.d, so nginx ignores it)
+    if (site.adopted && !site.rawConfig && prev !== null && !site.originalSaved) {
+      await host.runPriv('cp', ['-n', p, `${p}.original-before-panel`]);
+      site.originalSaved = true; this.store.save();
+    }
     await host.runPriv('mkdir', ['-p', this.config.acmeRoot]);
     if ((await this.readFile(host, this.mapPath())) !== MAP_CONF) await this.writeFile(host, this.mapPath(), MAP_CONF);
     await this.writeFile(host, p, conf);
@@ -553,6 +558,8 @@ done
   async update(id, input) {
     const site = this.find(id);
     const v = cleanSite(input, { partial: true });
+    // a hand-written nginx file is never silently replaced: choosing a new target means switching back to a generated file
+    if (site.rawConfig && v.upstream && v.rawConfig === undefined) throw httpError(409, 'This domain uses an nginx file that was written by hand, so changing where it points would have no effect. Switch it back to generated first (your original file is saved next to it).');
     if (v.domain && v.domain !== site.domain) throw httpError(400, 'The primary domain cannot be changed; add a new domain instead');
     this.validateOwnership(site.serverId, v, id);
     const next = { ...site, ...v };

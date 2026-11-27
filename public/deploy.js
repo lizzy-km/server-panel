@@ -554,7 +554,7 @@ function pageAppDetail(id) {
     const save = h('button', { class: 'primary', cmd: 'panel: saves the settings. They are used on the next deploy.' }, 'Save settings');
     save.onclick = act(save, async () => {
       err.classList.add('hidden');
-      try { const body = form.read(); delete body.env; await api('/api/apps', { method: 'PUT', body: { id, ...body } }); toast('Saved. Settings apply on the next deploy.'); await load(); }
+      try { const body = form.read(); delete body.env; const sv = await api('/api/apps', { method: 'PUT', body: { id, ...body } }); toast(sv.sitesUpdated && sv.sitesUpdated.length ? `Saved. nginx was regenerated for ${sv.sitesUpdated.join(', ')}. Other settings apply on the next deploy.` : 'Saved. Settings apply on the next deploy.'); if (sv.siteWarnings && sv.siteWarnings.length) fail(new Error(sv.siteWarnings.join('\n'))); await load(); }
       catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
     const del = h('button', { class: 'danger', cmd: `systemctl stop ${app.unit || '<app service>'}; systemctl disable ...; rm ${app.unit ? '<unit file>' : ''}\nrm -rf ${app.baseDir}/${app.name}   # only if you tick “also delete the files”` }, 'Delete app…');

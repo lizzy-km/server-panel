@@ -383,9 +383,19 @@ function createApp(overrides = {}) {
   scoped('PUT', '/api/apps', 'admin', async (ctx) => {
     const b = await readJson(ctx.req, 256 * 1024);
     appOf(ctx, b.id);
+    const before = appOf(ctx, b.id); const shape = (a) => JSON.stringify({ f: a.framework || 'node', s: require('./lib/presets').resolve(a).spa, o: require('./lib/presets').resolve(a).outputDir });
+    const was = shape(before);
     const app = deploy.update(b.id, b);
     note(ctx, 'app_update', app.name);
-    return { app: deploy.publicApp(app, { admin: true }) };
+    // the nginx configuration depends on the framework: regenerate the domains of this app when it changed
+    const sitesUpdated = []; const siteWarnings = [];
+    if (shape(app) !== was) {
+      for (const site of domains.sites.filter((x) => x.serverId === app.serverId && x.upstream.type === 'app' && x.upstream.appId === app.id && !x.rawConfig)) {
+        try { await domains.apply(site); sitesUpdated.push(site.domain); note(ctx, 'site_apply', `${site.domain} regenerated for the new framework`); }
+        catch (e) { siteWarnings.push(`${site.domain}: ${e.message}`); }
+      }
+    }
+    return { app: deploy.publicApp(app, { admin: true }), sitesUpdated, siteWarnings };
   });
   scoped('DELETE', '/api/apps', 'admin', async (ctx) => {
     const app = appOf(ctx, q(ctx, 'id'));

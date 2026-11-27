@@ -174,7 +174,7 @@ function siteForm(site, apps) {
   const f = {
     domain: h('input', { value: s.domain || '', placeholder: 'app.example.com', disabled: !!site }),
     aliases: h('input', { value: (s.aliases || []).join(', '), placeholder: 'www.example.com, other.example.com' }),
-    type: h('select', {}, [['app', 'An app deployed with the panel'], ['url', 'Any app running on a port (Node, Java, Docker, Python, …)'], ['php', 'A PHP / Laravel folder'], ['static', 'Static files'], ['redirect', 'Redirect to another address']].map(([v, l]) => h('option', { value: v, selected: v === u.type }, l))),
+    type: h('select', {}, [...(u.type === 'external' ? [['external', 'Existing nginx setup (kept as it is)']] : []), ['app', 'An app deployed with the panel'], ['url', 'Any app running on a port (Node, Java, Docker, Python, …)'], ['php', 'A PHP / Laravel folder'], ['static', 'Static files'], ['redirect', 'Redirect to another address']].map(([v, l]) => h('option', { value: v, selected: v === u.type }, l))),
     appId: h('select', {}, apps.length ? apps.map((a) => h('option', { value: a.id, selected: a.id === u.appId }, `${a.name} (${a.mode === 'service' ? `port ${a.port}` : a.mode === 'static' ? 'static website' : 'PHP'})`)) : h('option', { value: '' }, 'No apps on this server')),
     url: h('input', { value: u.url || 'http://127.0.0.1:3000' }),
     root: h('input', { value: u.root || '/var/www/site' }),
@@ -192,7 +192,7 @@ function siteForm(site, apps) {
   const target = h('div', {});
   const sync = () => {
     const t = f.type.value;
-    target.replaceChildren(t === 'app' ? field('App', f.appId, 'The panel sets up the right nginx configuration for the app type (reverse proxy, static files or PHP-FPM) and follows it if the app changes.')
+    target.replaceChildren(t === 'external' ? h('div', { class: 'muted', style: { fontSize: '12.5px', marginBottom: '10px' } }, `This site was added from an nginx file you wrote by hand (${u.kind || 'existing config'}${u.root ? `: ${u.root}` : u.target ? `: ${u.target}` : ''}). The panel keeps that file exactly as it is. Pick another option here only if you want the panel to generate the nginx configuration for this domain instead.`) : t === 'app' ? field('App', f.appId, 'The panel sets up the right nginx configuration for the app type (reverse proxy, static files or PHP-FPM) and follows it if the app changes.')
       : t === 'url' ? h('div', {}, field('Address of the app', f.url, 'For example http://127.0.0.1:8080. Works for anything that listens on a port: Node, Java, Python, Go, .NET, a Docker container…'), portPicker(f.url))
         : t === 'php' ? h('div', {}, field('Web folder of the PHP app', f.phpRoot, 'Type the app’s folder (for example /var/www/q-app) and press “Check folder”: the panel finds the right web folder (Laravel’s public/, WordPress, plain PHP) and the matching nginx settings.'), folderChecker(f, 'phpRoot'), laravelPicker(f.phpRoot))
           : t === 'redirect' ? h('div', {}, field('Send visitors to', f.redirectUrl, 'The path they asked for is kept, e.g. old.com/about → https://new.com/about'), h('label', { class: 'row' }, f.permanent, 'Permanent redirect (301). Untick for a temporary one (302).'))
@@ -210,7 +210,7 @@ function siteForm(site, apps) {
     const t = f.type.value;
     const body = {
       aliases: f.aliases.value, forceHttps: f.forceHttps.checked, hsts: f.hsts.checked, maxBodyMb: Number(f.maxBodyMb.value), customConfig: f.customConfig.value,
-      upstream: t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : t === 'php' ? { type: 'php', root: f.phpRoot.value.trim(), framework: f._framework || 'php' } : t === 'redirect' ? { type: 'redirect', url: f.redirectUrl.value.trim(), permanent: f.permanent.checked } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
+      upstream: t === 'external' ? undefined : t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : t === 'php' ? { type: 'php', root: f.phpRoot.value.trim(), framework: f._framework || 'php' } : t === 'redirect' ? { type: 'redirect', url: f.redirectUrl.value.trim(), permanent: f.permanent.checked } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
     };
     if (!site) body.domain = f.domain.value.trim();
     return body;
@@ -412,7 +412,12 @@ function pageDomainDetail(id) {
     const save = h('button', { class: 'primary', cmd: 'tee /etc/nginx/conf.d/panel-<domain>.conf   # regenerated from these settings\nnginx -t   # the previous file is restored if it fails\nsystemctl reload nginx' }, 'Save & apply');
     save.onclick = act(save, async () => {
       err.classList.add('hidden');
-      try { const sv = await api('/api/sites', { method: 'PUT', body: { id, ...form.read() } }); showWarnings(sv.warnings); toast('Saved. nginx reloaded.'); await load(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
+      try { const body = form.read();
+        if (site.manual && body.upstream) {
+          if (!(await confirmDialog('Let the panel generate the nginx file?', 'This domain currently uses an nginx file written by hand. Choosing a new target replaces it with a file generated by the panel (matching the framework). Your original file is saved next to it as “….original-before-panel”.', 'Generate', false))) return;
+          body.rawConfig = null;
+        }
+        const sv = await api('/api/sites', { method: 'PUT', body: { id, ...body } }); showWarnings(sv.warnings); toast('Saved. nginx reloaded.'); await load(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
     const generated = { text: '' };
     const right = h('div', { class: 'card' });

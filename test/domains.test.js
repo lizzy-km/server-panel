@@ -601,6 +601,27 @@ test('the panel warns when the web server user cannot reach the folder', { skip 
   } finally { st.app.config.webUser = 'nginx'; }
 });
 
+test('changing an app\'s framework regenerates the nginx config of its domains', { skip }, async () => {
+  const app = await st.call('POST', '/api/apps', { name: 'swap', framework: 'nextjs', repoUrl: 'https://github.com/o/r.git', port: 4500 });
+  assert.equal(app.status, 200, app.raw);
+  const r = await st.call('POST', '/api/sites', { domain: 'swap.test.example', upstream: { type: 'app', appId: app.json.app.id } });
+  assert.equal(r.status, 200, r.raw);
+  assert.match(readConf('swap.test.example'), /location \/_next\/static\//);
+  const up = await st.call('PUT', '/api/apps', { id: app.json.app.id, framework: 'nuxt' });
+  assert.equal(up.status, 200, up.raw);
+  assert.deepEqual(up.json.sitesUpdated, ['swap.test.example']);
+  const conf = readConf('swap.test.example');
+  assert.match(conf, /location \/_nuxt\//); assert.ok(!conf.includes('/_next/'), 'the old framework\'s rules are gone');
+  // an unrelated change does not touch nginx
+  assert.deepEqual((await st.call('PUT', '/api/apps', { id: app.json.app.id, keepReleases: 3 })).json.sitesUpdated, []);
+  // a site in manual mode is left alone
+  const m = await st.call('PUT', '/api/sites', { id: r.json.site.id, rawConfig: conf.replace('# Managed', '# Hand edited\n# Managed') });
+  assert.equal(m.status, 200, m.raw);
+  const kept = readConf('swap.test.example');
+  assert.deepEqual((await st.call('PUT', '/api/apps', { id: app.json.app.id, framework: 'nextjs' })).json.sitesUpdated, []);
+  assert.equal(readConf('swap.test.example'), kept, 'manual files are never rewritten by an app change');
+});
+
 test('removing a server forgets its apps and domains', { skip }, async () => {
   await st.call('POST', '/api/sites', { domain: 'gone.test.example', upstream: { type: 'url', url: 'http://127.0.0.1:1' } });
   await st.call('POST', '/api/apps', { name: 'gone', repoUrl: 'https://github.com/o/r.git', port: 4200 });

@@ -155,6 +155,12 @@ test('an adopted site is edited in place, never duplicated; editing the file els
   const bad = await st.call('PUT', '/api/sites', { id: siteId, rawConfig: edited + '\nbogus_directive on;\n' });
   assert.equal(bad.status, 400);
   assert.equal(fs.readFileSync(conf('q-app.conf'), 'utf8'), edited, 'rolled back');
+  // saving the Settings form of an adopted site (it sends no upstream) keeps the hand-written file and the "external" upstream
+  const before = fs.readFileSync(conf('q-app.conf'), 'utf8');
+  const form = await st.call('PUT', '/api/sites', { id: siteId, aliases: 'www.q-app.example.com', forceHttps: true, hsts: false, maxBodyMb: 20, customConfig: '' });
+  assert.equal(form.status, 200, form.raw);
+  assert.equal(form.json.site.upstream.type, 'external');
+  assert.equal(fs.readFileSync(conf('q-app.conf'), 'utf8'), before, 'the hand-written file is untouched');
   // the generic file editor updates the site record too
   const viaEditor = await st.call('PUT', '/api/nginx/file', { name: 'q-app.conf', content: edited.replace('DENY', 'SAMEORIGIN') });
   assert.equal(viaEditor.status, 200, viaEditor.raw);
@@ -351,3 +357,26 @@ test('adopted site: deleting only forgets it unless the file is explicitly delet
   assert.equal((await st.call('DELETE', `/api/sites?id=${again.json.site.id}&deleteFile=1`)).status, 200);
   assert.ok(!fs.existsSync(conf('q-app.conf')), 'explicit delete removes the file');
 });
+
+test('adopted site: choosing a target switches to a generated file and keeps the original', { skip }, async () => {
+  fs.writeFileSync(conf('q-app.conf'), HAND_WRITTEN(appDir, path.join(st.target.dirs.le, 'live/q-app.example.com')));
+  const again = await st.call('POST', '/api/sites/adopt', { file: 'q-app.conf' });
+  assert.equal(again.status, 200, again.raw);
+  const id = again.json.site.id; const original = fs.readFileSync(conf('q-app.conf'), 'utf8');
+  // asking for a new target while the hand-written file is in charge is refused (it would silently do nothing)
+  const refused = await st.call('PUT', '/api/sites', { id, upstream: { type: 'php', root: `${appDir}/public`, framework: 'laravel' } });
+  assert.equal(refused.status, 409); assert.match(refused.json.error, /written by hand/);
+  assert.equal(fs.readFileSync(conf('q-app.conf'), 'utf8'), original);
+  // switching back to generated does it, and saves the original file
+  const ok = await st.call('PUT', '/api/sites', { id, upstream: { type: 'php', root: `${appDir}/public`, framework: 'laravel' }, rawConfig: null });
+  assert.equal(ok.status, 200, ok.raw);
+  const now = fs.readFileSync(conf('q-app.conf'), 'utf8');
+  assert.match(now, /Managed by Server Panel/); assert.match(now, /fastcgi_hide_header X-Powered-By;/);
+  assert.equal(fs.readFileSync(conf('q-app.conf.original-before-panel'), 'utf8'), original, 'the hand-written file is kept');
+  // from now on the framework follows: a WordPress choice regenerates it
+  assert.equal((await st.call('PUT', '/api/sites', { id, upstream: { type: 'php', root: `${appDir}/public`, framework: 'wordpress' } })).status, 200);
+  assert.match(fs.readFileSync(conf('q-app.conf'), 'utf8'), /wp-config\.php/);
+  assert.equal(fs.readFileSync(conf('q-app.conf.original-before-panel'), 'utf8'), original, 'the original is saved only once');
+  await st.call('DELETE', `/api/sites?id=${id}&deleteFile=1`);
+});
+
