@@ -1,0 +1,13 @@
+{
+  "name": "server-panel",
+  "version": "1.0.0",
+  "description": "Self-hosted server control panel: monitoring, processes, services, Docker, files, logs, cron, terminal, users and audit log. Zero dependencies.",
+  "type": "commonjs",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}
