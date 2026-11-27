@@ -119,6 +119,33 @@ function discoveryCard(onAdopted) {
   return box;
 }
 
+/** Pick a port that something on the server is already listening on (Docker containers show up here too). */
+function portPicker(urlInput) {
+  const sel = h('select', {}, h('option', { value: '' }, 'Looking for running apps…'));
+  api('/api/network/ports').then((r) => {
+    const seen = new Set(); const opts = [];
+    for (const x of r.list || []) {
+      if (!/^tcp/.test(x.proto) || x.state !== 'LISTEN') continue;
+      const port = Number((x.local.match(/:(\d+)$/) || [])[1]); if (!port || [22, 25, 80, 443, 3306, 5432, 6379, 53].includes(port) || seen.has(port)) continue;
+      seen.add(port); opts.push([port, x.process || '']);
+    }
+    opts.sort((a, b) => a[0] - b[0]);
+    sel.replaceChildren(h('option', { value: '' }, opts.length ? 'Pick a running app…' : 'No running apps found'), ...opts.map(([p, n]) => h('option', { value: p }, `port ${p}${n ? ` — ${n === 'docker-proxy' ? 'Docker container' : n}` : ''}`)));
+  }).catch(() => sel.replaceChildren(h('option', { value: '' }, 'Could not list running apps')));
+  sel.onchange = () => { if (sel.value) urlInput.value = `http://127.0.0.1:${sel.value}`; };
+  return h('div', { class: 'field' }, h('label', {}, 'Or choose from what is running on this server'), sel);
+}
+
+/** Fill the folder from an existing (adopted) Laravel app. */
+function laravelPicker(rootInput) {
+  const sel = h('select', {}, h('option', { value: '' }, 'Looking for Laravel apps…'));
+  api('/api/laravel').then((r) => {
+    sel.replaceChildren(h('option', { value: '' }, r.apps.length ? 'Or pick an existing Laravel app…' : 'No Laravel apps added yet'), ...r.apps.map((a) => h('option', { value: `${a.path.replace(/\/+$/, '')}/public` }, `${a.name} (${a.path})`)));
+  }).catch(() => sel.replaceChildren(h('option', { value: '' }, '')));
+  sel.onchange = () => { if (sel.value) rootInput.value = sel.value; };
+  return h('div', { class: 'field' }, sel);
+}
+
 // ---------------------------------------------------------------- add / configure form
 function siteForm(site, apps) {
   const s = site || { aliases: [], upstream: { type: 'app' }, forceHttps: true, hsts: false, maxBodyMb: 10, customConfig: '' };
@@ -126,10 +153,13 @@ function siteForm(site, apps) {
   const f = {
     domain: h('input', { value: s.domain || '', placeholder: 'app.example.com', disabled: !!site }),
     aliases: h('input', { value: (s.aliases || []).join(', '), placeholder: 'www.example.com, other.example.com' }),
-    type: h('select', {}, [['app', 'A deployed app'], ['url', 'A URL / port on this server'], ['static', 'Static files']].map(([v, l]) => h('option', { value: v, selected: v === u.type }, l))),
+    type: h('select', {}, [['app', 'An app deployed with the panel'], ['url', 'Any app running on a port (Node, Java, Docker, Python, …)'], ['php', 'A PHP / Laravel folder'], ['static', 'Static files'], ['redirect', 'Redirect to another address']].map(([v, l]) => h('option', { value: v, selected: v === u.type }, l))),
     appId: h('select', {}, apps.length ? apps.map((a) => h('option', { value: a.id, selected: a.id === u.appId }, `${a.name} (${a.mode === 'service' ? `port ${a.port}` : a.mode === 'static' ? 'static website' : 'PHP'})`)) : h('option', { value: '' }, 'No apps on this server')),
     url: h('input', { value: u.url || 'http://127.0.0.1:3000' }),
     root: h('input', { value: u.root || '/var/www/site' }),
+    phpRoot: h('input', { value: u.type === 'php' ? u.root : '/var/www/site/public' }),
+    redirectUrl: h('input', { value: u.url && u.type === 'redirect' ? u.url : 'https://www.example.com' }),
+    permanent: h('input', { type: 'checkbox', checked: u.permanent !== false }),
     spa: h('input', { type: 'checkbox', checked: !!u.spa }),
     forceHttps: h('input', { type: 'checkbox', checked: s.forceHttps !== false }),
     hsts: h('input', { type: 'checkbox', checked: !!s.hsts }),
@@ -141,7 +171,9 @@ function siteForm(site, apps) {
   const sync = () => {
     const t = f.type.value;
     target.replaceChildren(t === 'app' ? field('App', f.appId, 'The panel sets up the right nginx configuration for the app type (reverse proxy, static files or PHP-FPM) and follows it if the app changes.')
-      : t === 'url' ? field('Upstream URL', f.url, 'For example http://127.0.0.1:8080 (a service you run yourself)')
+      : t === 'url' ? h('div', {}, field('Address of the app', f.url, 'For example http://127.0.0.1:8080. Works for anything that listens on a port: Node, Java, Python, Go, .NET, a Docker container…'), portPicker(f.url))
+        : t === 'php' ? h('div', {}, field('Web folder of the PHP app', f.phpRoot, 'The folder nginx should serve: for Laravel it is the “public” folder inside the app.'), laravelPicker(f.phpRoot))
+          : t === 'redirect' ? h('div', {}, field('Send visitors to', f.redirectUrl, 'The path they asked for is kept, e.g. old.com/about → https://new.com/about'), h('label', { class: 'row' }, f.permanent, 'Permanent redirect (301). Untick for a temporary one (302).'))
         : h('div', {}, field('Folder on the server', f.root, 'nginx must be able to read it'), h('label', { class: 'row' }, f.spa, 'Single-page app (serve index.html for unknown paths)')));
   };
   f.type.addEventListener('change', sync); sync();
@@ -156,7 +188,7 @@ function siteForm(site, apps) {
     const t = f.type.value;
     const body = {
       aliases: f.aliases.value, forceHttps: f.forceHttps.checked, hsts: f.hsts.checked, maxBodyMb: Number(f.maxBodyMb.value), customConfig: f.customConfig.value,
-      upstream: t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
+      upstream: t === 'app' ? { type: 'app', appId: f.appId.value } : t === 'url' ? { type: 'url', url: f.url.value.trim() } : t === 'php' ? { type: 'php', root: f.phpRoot.value.trim() } : t === 'redirect' ? { type: 'redirect', url: f.redirectUrl.value.trim(), permanent: f.permanent.checked } : { type: 'static', root: f.root.value.trim(), spa: f.spa.checked },
     };
     if (!site) body.domain = f.domain.value.trim();
     return body;

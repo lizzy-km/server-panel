@@ -49,7 +49,15 @@ function cleanSite(input, { partial = false } = {}) {
       const root = String(u.root || '').trim();
       if (!ROOT_RE.test(root) || root.includes('..')) throw httpError(400, 'Static root must be an absolute path such as /var/www/site');
       out.upstream = { type: 'static', root, spa: !!u.spa };
-    } else throw httpError(400, 'Upstream type must be app, url or static');
+    } else if (u.type === 'php') {
+      const root = String(u.root || '').trim().replace(/\/+$/, '');
+      if (!ROOT_RE.test(root) || root.includes('..')) throw httpError(400, 'PHP folder must be an absolute path such as /var/www/site/public (for Laravel: the public folder)');
+      out.upstream = { type: 'php', root };
+    } else if (u.type === 'redirect') {
+      const url = String(u.url || '').trim().replace(/\/+$/, '');
+      if (!URL_RE.test(url)) throw httpError(400, 'Redirect target must look like https://www.example.com');
+      out.upstream = { type: 'redirect', url, permanent: u.permanent !== false };
+    } else throw httpError(400, 'Upstream type must be app, url, php, static or redirect');
   }
   if (has('forceHttps')) out.forceHttps = !!input.forceHttps;
   if (has('hsts')) out.hsts = !!input.hsts;
@@ -78,7 +86,8 @@ function renderNginx(site, ctx) {
   const v6 = ctx.ipv6 !== false;
   const cert = tls ? `${ctx.letsencryptDir}/live/${site.tls.certName}` : null;
   const up = site.upstream;
-  const app = ctx.app && (ctx.app.mode === 'static' || ctx.app.mode === 'php') ? ctx.app : null; // {mode, root, spa, fastcgi}
+  const app = ctx.app && (ctx.app.mode === 'static' || ctx.app.mode === 'php') ? ctx.app : null;
+  const redirect = up.type === 'redirect' ? `    location / {\n        return ${up.permanent === false ? 302 : 301} ${up.url}$request_uri;\n    }` : null; // {mode, root, spa, fastcgi}
   const body = up.type === 'static'
     ? `        root ${up.root};\n        index index.html;\n        try_files $uri ${up.spa ? '/index.html' : '$uri/ =404'};`
     : `        proxy_pass ${ctx.upstreamUrl};
@@ -125,7 +134,7 @@ ${custom}`;
         add_header Cache-Control "public";
         try_files $uri =404;
     }`;
-  const proxyLocation = appLocations || `    location / {\n${body}\n    }`;
+  const proxyLocation = redirect || appLocations || `    location / {\n${body}\n    }`;
 
   let out = `# Managed by Server Panel (site ${site.id}). Edit it in the panel; manual changes are overwritten.\n`;
   if (!tls) {
@@ -174,7 +183,7 @@ class DomainManager {
   upstreamLabel(site, app) {
     const u = site.upstream;
     if (u.type === 'external') return `existing config (${u.kind}${u.root ? `: ${u.root}` : u.target ? `: ${u.target}` : ''})`;
-    return u.type === 'app' ? `app: ${app ? app.name : '(deleted)'}${app ? ` (${P.BY_ID[app.framework || 'node'].label.split(' (')[0]})` : ''}` : u.type === 'url' ? u.url : `static: ${u.root}`;
+    return u.type === 'app' ? `app: ${app ? app.name : '(deleted)'}${app ? ` (${P.BY_ID[app.framework || 'node'].label.split(' (')[0]})` : ''}` : u.type === 'url' ? u.url : u.type === 'php' ? `PHP site: ${u.root}` : u.type === 'redirect' ? `redirects to ${u.url}` : `static: ${u.root}`;
   }
   list(serverId, admin = true) { return this.sites.filter((s) => s.serverId === serverId).map((s) => this.publicSite(s, admin)); }
 
@@ -191,6 +200,7 @@ class DomainManager {
 
   /** For apps that nginx serves directly (static builds, PHP): where the files are and how to serve them. */
   appCtx(site) {
+    if (site.upstream && site.upstream.type === 'php') return { mode: 'php', root: site.upstream.root, fastcgi: this.config.phpSocket };
     if (!site.upstream || site.upstream.type !== 'app') return null;
     const app = this.deploy.apps.find((a) => a.id === site.upstream.appId);
     if (!app) return null;

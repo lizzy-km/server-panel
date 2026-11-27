@@ -503,6 +503,36 @@ test('changing an app\'s port repoints its domains once the new port is live', {
   fs.rmSync(repo.dir, { recursive: true, force: true });
 });
 
+test('renderNginx: PHP folders and redirects', () => {
+  const php = renderNginx(site({ upstream: { type: 'php', root: '/var/www/q-app/public' } }), { ...baseCtx, app: { mode: 'php', root: '/var/www/q-app/public', fastcgi: 'unix:/run/php-fpm/www.sock' }, upstreamUrl: null });
+  assert.match(php, /root \/var\/www\/q-app\/public;/);
+  assert.match(php, /fastcgi_pass unix:\/run\/php-fpm\/www\.sock;/);
+  assert.match(php, /try_files \$uri \$uri\/ \/index\.php\?\$query_string;/);
+  assert.ok(!php.includes('proxy_pass'));
+  const perm = renderNginx(site({ upstream: { type: 'redirect', url: 'https://new.example.com', permanent: true } }), { ...baseCtx, upstreamUrl: null });
+  assert.match(perm, /return 301 https:\/\/new\.example\.com\$request_uri;/);
+  assert.match(renderNginx(site({ upstream: { type: 'redirect', url: 'https://new.example.com', permanent: false } }), { ...baseCtx, upstreamUrl: null }), /return 302 /);
+});
+
+test('domains for any kind of app: a port (Node/Java/Docker…), a PHP folder, a redirect', { skip }, async () => {
+  const url = await st.call('POST', '/api/sites', { domain: 'api.test.example', upstream: { type: 'url', url: 'http://127.0.0.1:8081' } });
+  assert.equal(url.status, 200, url.raw);
+  assert.match(readConf('api.test.example'), /proxy_pass http:\/\/127\.0\.0\.1:8081;/);
+  const php = await st.call('POST', '/api/sites', { domain: 'legacy.test.example', upstream: { type: 'php', root: '/var/www/legacy/public' } });
+  assert.equal(php.status, 200, php.raw);
+  const conf = readConf('legacy.test.example');
+  assert.match(conf, /root \/var\/www\/legacy\/public;/); assert.match(conf, /fastcgi_pass /);
+  assert.match(php.json.site.upstreamLabel, /PHP site: \/var\/www\/legacy\/public/);
+  const red = await st.call('POST', '/api/sites', { domain: 'old.test.example', upstream: { type: 'redirect', url: 'https://new.test.example' } });
+  assert.equal(red.status, 200, red.raw);
+  assert.match(readConf('old.test.example'), /return 301 https:\/\/new\.test\.example\$request_uri;/);
+  assert.match(red.json.site.upstreamLabel, /redirects to https:\/\/new\.test\.example/);
+  // bad input never reaches nginx
+  assert.equal((await st.call('POST', '/api/sites', { domain: 'bad1.test.example', upstream: { type: 'php', root: 'relative/path' } })).status, 400);
+  assert.equal((await st.call('POST', '/api/sites', { domain: 'bad2.test.example', upstream: { type: 'redirect', url: 'javascript:alert(1)' } })).status, 400);
+  assert.equal((await st.call('POST', '/api/sites', { domain: 'bad3.test.example', upstream: { type: 'redirect', url: 'https://x.com;}server{' } })).status, 400);
+});
+
 test('removing a server forgets its apps and domains', { skip }, async () => {
   await st.call('POST', '/api/sites', { domain: 'gone.test.example', upstream: { type: 'url', url: 'http://127.0.0.1:1' } });
   await st.call('POST', '/api/apps', { name: 'gone', repoUrl: 'https://github.com/o/r.git', port: 4200 });
