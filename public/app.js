@@ -9,6 +9,7 @@ function h(tag, props, ...children) {
   const el = svg ? document.createElementNS(SVGNS, tag) : document.createElement(tag);
   for (const [k, v] of Object.entries(props || {})) {
     if (v === undefined || v === null || v === false) continue;
+    if (k === 'cmd') { el.setAttribute('data-cmd', v); el.setAttribute('aria-description', `Runs: ${v}`); continue; }
     if (k === 'class') el.setAttribute('class', v);
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
     else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
@@ -22,6 +23,32 @@ function h(tag, props, ...children) {
   return el;
 }
 const $ = (sel, root = document) => root.querySelector(sel);
+
+/* "What does this button do?": anything with a `cmd` shows the command it runs when hovered or focused. */
+(function commandTips() {
+  let tip = null; let current = null;
+  const hide = () => { if (tip) tip.remove(); tip = null; current = null; };
+  const show = (el) => {
+    if (el === current) return;
+    hide(); current = el;
+    const text = el.getAttribute('data-cmd'); if (!text) return;
+    const panelOnly = /^panel:/.test(text);
+    tip = document.createElement('div'); tip.className = 'cmdtip'; tip.setAttribute('role', 'tooltip');
+    const head = document.createElement('div'); head.className = 'cmdtip-head';
+    head.textContent = panelOnly ? 'Panel action (no command runs on the server)' : 'Runs on the server';
+    const body = document.createElement('div'); body.className = 'cmdtip-body';
+    body.textContent = panelOnly ? text.replace(/^panel:\s*/, '') : text.split('\n').map((l) => (/^(#|SFTP)/.test(l) ? l : `$ ${l}`)).join('\n');
+    tip.append(head, body); document.body.append(tip);
+    const r = el.getBoundingClientRect(); const t = tip.getBoundingClientRect();
+    let left = Math.min(Math.max(8, r.left), window.innerWidth - t.width - 8);
+    let top = r.bottom + 8; if (top + t.height > window.innerHeight - 8) top = Math.max(8, r.top - t.height - 8);
+    tip.style.left = `${left}px`; tip.style.top = `${top}px`;
+  };
+  document.addEventListener('mouseover', (e) => { const el = e.target.closest && e.target.closest('[data-cmd]'); if (el) show(el); else hide(); });
+  document.addEventListener('focusin', (e) => { const el = e.target.closest && e.target.closest('[data-cmd]'); if (el) show(el); });
+  document.addEventListener('focusout', hide); document.addEventListener('mousedown', hide); document.addEventListener('scroll', hide, true);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hide(); });
+}());
 
 const fmt = {
   bytes(n, d = 1) {
@@ -73,7 +100,7 @@ function modal(title, content, { wide = false, actions = [] } = {}) {
   const bg = h('div', { class: 'modal-bg', onmousedown: (e) => { if (e.target === bg) close(); } },
     h('div', { class: 'modal' + (wide ? ' wide' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': title },
       h('h2', {}, title), content,
-      actions.length ? h('div', { class: 'actions' }, actions.map((a) => h('button', { class: a.cls || '', onclick: () => a.onclick(close) }, a.label))) : null));
+      actions.length ? h('div', { class: 'actions' }, actions.map((a) => h('button', { class: a.cls || '', cmd: a.cmd, onclick: () => a.onclick(close) }, a.label))) : null));
   bg.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
   document.body.append(bg);
   const first = bg.querySelector('input,textarea,select,button.primary');
@@ -230,6 +257,7 @@ const NAV = [
   { id: 'files', label: 'Files', icon: '▤', admin: true, page: () => pageFiles() },
   { id: 'logs', label: 'Logs', icon: '≣', admin: true, page: () => pageLogs() },
   { id: 'cron', label: 'Cron jobs', icon: '◷', admin: true, page: () => pageCron() },
+  { id: 'cheatsheet', label: 'Cheat sheet', icon: '☰', page: () => pageCheatSheet() },
   { id: 'terminal', label: 'Terminal', icon: '>_', admin: true, page: () => pageTerminal() },
   { sep: true, admin: true },
   { id: 'users', label: 'Users', icon: '☺', admin: true, page: () => pageUsers() },
@@ -432,7 +460,7 @@ function pageDashboard() {
       h('div', { class: 'bar ' + level(d.percent) }, h('span', { style: { width: `${d.percent}%` } })))) : [h('div', { class: 'empty' }, 'No disks reported')]));
   }
   if (state.user.role === 'admin') {
-    header.lastChild.append(h('button', { class: 'sm', onclick: thresholdDialog }, 'Alert thresholds'));
+    header.lastChild.append(h('button', { class: 'sm', cmd: 'panel: sets when the dashboard shows CPU / memory / disk warnings', onclick: thresholdDialog }, 'Alert thresholds'));
   }
   poll(tickMetrics, 3000); poll(tickSlow, 15000);
   return root;
@@ -459,7 +487,7 @@ function pageProcesses() {
   const search = h('input', { placeholder: 'Filter by name, user, PID, command…', class: 'grow', oninput: () => draw() });
   let rows = [];
   let paused = false;
-  const pause = h('button', { onclick: () => { paused = !paused; pause.textContent = paused ? 'Resume' : 'Pause'; } }, 'Pause');
+  const pause = h('button', { cmd: 'panel: stops/starts the automatic refresh of this list', onclick: () => { paused = !paused; pause.textContent = paused ? 'Resume' : 'Pause'; } }, 'Pause');
   const columns = [
     { key: 'pid', label: 'PID', num: true }, { key: 'user', label: 'User' },
     { key: 'cpu', label: 'CPU %', num: true }, { key: 'mem', label: 'MEM %', num: true },
@@ -470,8 +498,8 @@ function pageProcesses() {
     holder.replaceChildren(dataTable({
       columns, rows, sort, filterText: search.value, empty: 'No matching processes',
       rowActions: isAdmin ? (r) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        h('button', { class: 'sm', onclick: () => signal(r, 'SIGTERM') }, 'Stop'),
-        h('button', { class: 'sm danger', onclick: () => signal(r, 'SIGKILL') }, 'Kill')) : null,
+        h('button', { class: 'sm', cmd: `kill -s TERM ${r.pid}   # asks the process to exit cleanly`, onclick: () => signal(r, 'SIGTERM') }, 'Stop'),
+        h('button', { class: 'sm danger', cmd: `kill -s KILL ${r.pid}   # ends it immediately`, onclick: () => signal(r, 'SIGKILL') }, 'Kill')) : null,
     }));
   }
   async function signal(r, sig) {
@@ -515,9 +543,9 @@ function pageServices() {
       ],
       rows, sort, filterText: search.value, empty: 'No matching services',
       rowActions: isAdmin ? (r) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        r.active === 'active' ? h('button', { class: 'sm', onclick: () => act_(r.unit, 'restart') }, 'Restart') : h('button', { class: 'sm', onclick: () => act_(r.unit, 'start') }, 'Start'),
-        r.active === 'active' ? h('button', { class: 'sm danger', onclick: () => act_(r.unit, 'stop') }, 'Stop') : null,
-        h('button', { class: 'sm', onclick: () => act_(r.unit, r.enabled === 'enabled' ? 'disable' : 'enable') }, r.enabled === 'enabled' ? 'Disable' : 'Enable')) : null,
+        r.active === 'active' ? h('button', { class: 'sm', cmd: `systemctl restart ${r.unit}`, onclick: () => act_(r.unit, 'restart') }, 'Restart') : h('button', { class: 'sm', cmd: `systemctl start ${r.unit}`, onclick: () => act_(r.unit, 'start') }, 'Start'),
+        r.active === 'active' ? h('button', { class: 'sm danger', cmd: `systemctl stop ${r.unit}`, onclick: () => act_(r.unit, 'stop') }, 'Stop') : null,
+        h('button', { class: 'sm', cmd: `systemctl ${r.enabled === 'enabled' ? 'disable' : 'enable'} ${r.unit}   # ${r.enabled === 'enabled' ? 'no longer starts at boot' : 'starts at boot'}`, onclick: () => act_(r.unit, r.enabled === 'enabled' ? 'disable' : 'enable') }, r.enabled === 'enabled' ? 'Disable' : 'Enable')) : null,
     }));
   }
   async function load() {
@@ -536,9 +564,9 @@ function pagePackages() {
   const search = h('input', { class: 'grow', placeholder: 'Filter packages…', oninput: () => draw() });
   const sort = { key: 'name', dir: 'asc', onSort(k) { sort.dir = sort.key === k && sort.dir === 'asc' ? 'desc' : 'asc'; sort.key = k; draw(); } };
   let data = null;
-  const refresh = h('button', {}, 'Check for updates');
-  const secBtn = h('button', { class: 'primary', disabled: true }, 'Install security updates');
-  const allBtn = h('button', { class: 'danger', disabled: true }, 'Update everything');
+  const refresh = h('button', { cmd: 'dnf -q check-update --refresh\ndnf -q updateinfo list --security' }, 'Check for updates');
+  const secBtn = h('button', { class: 'primary', disabled: true, cmd: 'dnf -y upgrade --security' }, 'Install security updates');
+  const allBtn = h('button', { class: 'danger', disabled: true, cmd: 'dnf -y upgrade' }, 'Update everything');
 
   async function run(body, label) {
     if (!(await confirmDialog(label + '?', 'This runs dnf on the server and can take several minutes. Services may restart.', 'Run', false))) return;
@@ -568,7 +596,7 @@ function pagePackages() {
           { key: 'security', label: 'Security', render: (u) => u.security ? h('span', { class: 'badge ' + (['Critical', 'Important'].includes(u.security) ? 'bad' : 'warn'), title: u.advisory }, u.security) : '–' },
         ],
         rows: data.updates, sort, filterText: search.value, empty: 'System is up to date 🎉',
-        rowActions: isAdmin ? (u) => h('button', { class: 'sm', onclick: () => run({ packages: [u.name] }, `Update ${u.name}`) }, 'Update') : null,
+        rowActions: isAdmin ? (u) => h('button', { class: 'sm', cmd: `dnf -y upgrade ${u.name}`, onclick: () => run({ packages: [u.name] }, `Update ${u.name}`) }, 'Update') : null,
       }));
   }
   async function load(force) {
@@ -606,9 +634,9 @@ function pageDocker() {
       ],
       rows: r.containers, empty: 'No containers',
       rowActions: (c) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        isAdmin ? h('button', { class: 'sm', onclick: () => logs(c) }, 'Logs') : null,
-        ...(isAdmin ? (c.state === 'running' ? [h('button', { class: 'sm', onclick: () => dact(c.id, 'restart') }, 'Restart'), h('button', { class: 'sm danger', onclick: () => dact(c.id, 'stop') }, 'Stop')]
-          : [h('button', { class: 'sm', onclick: () => dact(c.id, 'start') }, 'Start'), h('button', { class: 'sm danger', onclick: () => dact(c.id, 'rm') }, 'Remove')]) : [])),
+        isAdmin ? h('button', { class: 'sm', cmd: `docker logs --tail 500 --timestamps ${c.name}`, onclick: () => logs(c) }, 'Logs') : null,
+        ...(isAdmin ? (c.state === 'running' ? [h('button', { class: 'sm', cmd: `docker restart ${c.name}`, onclick: () => dact(c.id, 'restart') }, 'Restart'), h('button', { class: 'sm danger', cmd: `docker stop ${c.name}`, onclick: () => dact(c.id, 'stop') }, 'Stop')]
+          : [h('button', { class: 'sm', cmd: `docker start ${c.name}`, onclick: () => dact(c.id, 'start') }, 'Start'), h('button', { class: 'sm danger', cmd: `docker rm ${c.name}   # removes the stopped container (not its image)`, onclick: () => dact(c.id, 'rm') }, 'Remove')]) : [])),
     }));
     iBox.replaceChildren(h('h2', {}, `Images (${r.images.length})`), dataTable({
       columns: [{ key: 'repo', label: 'Repository' }, { key: 'tag', label: 'Tag' }, { key: 'id', label: 'ID' }, { key: 'size', label: 'Size', num: true }, { key: 'created', label: 'Created' }],
@@ -671,9 +699,9 @@ function pageFiles() {
         rows: r.entries, sort: { key: 'name', dir: 'asc', onSort() {} }, empty: 'This folder is empty',
         rowActions: (e) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
           e.type === 'file' ? h('a', { class: 'btn sm', style: { textDecoration: 'none', fontSize: '12px', padding: '3px 9px' }, href: withServer('/api/files/download?path=' + encodeURIComponent(join(cwd, e.name))) }, 'Download') : null,
-          h('button', { class: 'sm', onclick: () => rename(e) }, 'Rename'),
-          h('button', { class: 'sm', onclick: () => chmod(e) }, 'chmod'),
-          h('button', { class: 'sm danger', onclick: () => del(e) }, 'Delete')),
+          h('button', { class: 'sm', cmd: `SFTP rename ${e.name}   # no shell command`, onclick: () => rename(e) }, 'Rename'),
+          h('button', { class: 'sm', cmd: `SFTP chmod <mode> ${e.name}   # same as: chmod <mode> ${e.name}`, onclick: () => chmod(e) }, 'chmod'),
+          h('button', { class: 'sm danger', cmd: `SFTP ${e.type === 'dir' ? 'rmdir / delete' : 'remove'} ${e.name}   # same as: rm ${e.type === 'dir' ? '-r ' : ''}${e.name}`, onclick: () => del(e) }, 'Delete')),
       }));
     } catch (e) { fail(e); if (cwd !== '/') { cwd = '/'; go('/'); } }
   }
@@ -690,7 +718,7 @@ function pageFiles() {
       if (e.key === 'Tab') { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText('\t', s, ta.selectionEnd, 'end'); }
       if ((e.ctrlKey || e.metaKey) && e.key === 's') { e.preventDefault(); save.click(); }
     });
-    const save = h('button', { class: 'primary' }, 'Save');
+    const save = h('button', { class: 'primary', cmd: 'SFTP write file   # replaces the file with the editor contents' }, 'Save');
     save.onclick = act(save, async () => { await api('/api/files/write', { method: 'PUT', body: { path, content: ta.value } }); toast('Saved'); });
     modal(path, ta, { wide: true, actions: [{ label: 'Close', onclick: (c) => c() }] });
     document.querySelector('.modal .actions').prepend(save);
@@ -729,9 +757,9 @@ function pageFiles() {
   root.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.add('hidden'); upload([...e.dataTransfer.files]); });
   root.append(pageHeader('Files', `Browse and edit files on ${(currentServer() || {}).name || ''} (root: ${(currentServer() || {}).fileRoot || '/'})`),
     h('div', { class: 'toolbar' }, crumbs, h('span', { class: 'grow' }),
-      h('button', { onclick: () => go(parent(cwd)) }, '↑ Up'), h('button', { onclick: () => go(cwd) }, 'Refresh'),
-      h('button', { onclick: () => newItem('file') }, 'New file'), h('button', { onclick: () => newItem('dir') }, 'New folder'),
-      h('button', { class: 'primary', onclick: () => picker.click() }, 'Upload'), picker),
+      h('button', { cmd: 'SFTP list parent folder   # same as: ls -la ..', onclick: () => go(parent(cwd)) }, '↑ Up'), h('button', { cmd: 'SFTP list this folder   # same as: ls -la', onclick: () => go(cwd) }, 'Refresh'),
+      h('button', { cmd: 'SFTP create empty file   # same as: touch <name>', onclick: () => newItem('file') }, 'New file'), h('button', { cmd: 'SFTP mkdir   # same as: mkdir <name>', onclick: () => newItem('dir') }, 'New folder'),
+      h('button', { class: 'primary', cmd: 'SFTP upload   # writes the chosen file into this folder', onclick: () => picker.click() }, 'Upload'), picker),
     drop, listBox);
   go(cwd);
   return root;
@@ -770,14 +798,14 @@ function pageLogs() {
   })();
   poll(() => (follow.checked ? load() : null), 3000);
   return h('div', {}, pageHeader('Logs', 'Journal and log files'),
-    h('div', { class: 'toolbar' }, mode, fileSel, unit, prio, lines, filter, h('label', { class: 'row' }, follow, 'Follow'), h('button', { onclick: load }, 'Refresh')), out);
+    h('div', { class: 'toolbar' }, mode, fileSel, unit, prio, lines, filter, h('label', { class: 'row' }, follow, 'Follow'), h('button', { cmd: 'journalctl -u <service> -n <lines> --no-pager\ntail -c 2097152 <log file>   # whichever source is selected', onclick: load }, 'Refresh')), out);
 }
 
 // ---------------------------------------------------------------- cron
 function pageCron() {
   const ta = h('textarea', { class: 'editor', spellcheck: false, style: { minHeight: '40vh' } });
   const info = h('div', { class: 'notice', style: { marginBottom: '12px' } }, 'Edits the crontab of the user running the panel. Format: minute hour day-of-month month day-of-week command');
-  const save = h('button', { class: 'primary' }, 'Save crontab');
+  const save = h('button', { class: 'primary', cmd: 'crontab -   # replaces your crontab with the text in the editor' }, 'Save crontab');
   save.onclick = act(save, async () => { await api('/api/cron', { method: 'PUT', body: { content: ta.value } }); toast('Crontab saved'); });
   (async () => {
     try { const r = await api('/api/cron'); if (!r.available) { ta.disabled = true; save.disabled = true; info.textContent = r.hint || 'crontab is not installed on this host.'; } ta.value = r.content; } catch (e) { fail(e); }
@@ -790,6 +818,7 @@ function pageCron() {
 function pageTerminal() {
   const out = h('div', { class: 'terminal-out', style: { minHeight: '40vh' }, tabindex: 0 });
   const input = h('input', { class: 'grow mono', placeholder: state.features.exec ? 'Run a command (non-interactive, 30 s timeout)…' : 'Command execution is disabled on this server', disabled: !state.features.exec, autocomplete: 'off', spellcheck: false });
+  try { const pre = sessionStorage.getItem('cheat.prefill'); if (pre) { input.value = pre; sessionStorage.removeItem('cheat.prefill'); } } catch { /* ignore */ }
   const history = JSON.parse(sessionStorageGet('panel-hist') || '[]');
   let hi = history.length;
   const line = (cls, text) => out.append(h('div', { class: cls }, text));
@@ -811,8 +840,8 @@ function pageTerminal() {
     else if (e.key === 'ArrowDown') { hi = Math.min(history.length, hi + 1); input.value = history[hi] || ''; e.preventDefault(); }
   });
   line('meta', 'Each command runs in a fresh bash process (no TTY). Every command is recorded in the audit log.');
-  return h('div', {}, pageHeader('Terminal', `One-shot command runner on ${(currentServer() || {}).name || ''}`, h('button', { onclick: () => out.replaceChildren() }, 'Clear')),
-    out, h('div', { class: 'row grow', style: { marginTop: '10px' } }, h('span', { class: 'mono muted' }, '$'), input, h('button', { class: 'primary', onclick: runIt }, 'Run')));
+  return h('div', {}, pageHeader('Terminal', `One-shot command runner on ${(currentServer() || {}).name || ''}`, h('button', { cmd: 'panel: clears the output below', onclick: () => out.replaceChildren() }, 'Clear')),
+    out, h('div', { class: 'row grow', style: { marginTop: '10px' } }, h('span', { class: 'mono muted' }, '$'), input, h('button', { class: 'primary', cmd: 'bash -c "<what you typed>"   # exactly your text, nothing added', onclick: runIt }, 'Run')));
 }
 
 // ---------------------------------------------------------------- servers (SSH targets)
@@ -879,8 +908,8 @@ function addServerDialog() {
   const err = h('div', { class: 'alert crit hidden', role: 'alert' });
   let fingerprint = null; let confirmed = false;
 
-  const next = h('button', { class: 'primary' }, 'Next: verify host key');
-  const add = h('button', { class: 'primary', disabled: true }, 'Connect & add server');
+  const next = h('button', { class: 'primary', cmd: 'ssh-keyscan -p <port> <host>   # shows the host key fingerprint so you can confirm it' }, 'Next: verify host key');
+  const add = h('button', { class: 'primary', disabled: true, cmd: 'ssh <user>@<host> true   # connects once with your key, then saves the server (the key is stored encrypted)' }, 'Connect & add server');
   const back = h('button', { class: 'hidden' }, 'Back');
   const cancel = h('button', {}, 'Cancel');
   const showErr = (m) => { err.textContent = m; err.classList.toggle('hidden', !m); };
@@ -937,7 +966,7 @@ function editServerDialog(sv) {
   const err = h('div', { class: 'alert crit hidden', role: 'alert' });
   let newFp = null; let newFpOk = false;
   const fpBox = h('div', {});
-  const reverify = h('button', { class: 'sm' }, 'Re-verify host key');
+  const reverify = h('button', { class: 'sm', cmd: 'ssh-keyscan -p <port> <host>   # reads the server host key to compare its fingerprint' }, 'Re-verify host key');
   reverify.onclick = act(reverify, async () => {
     const r = await api('/api/servers/probe', { method: 'POST', body: { host: f.host.value.trim(), port: Number(f.port.value) } });
     newFp = r.fingerprint; newFpOk = false;
@@ -979,9 +1008,9 @@ function pageServers() {
       rows, empty: '',
       rowActions: (x) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
         h('button', { class: 'sm primary', onclick: () => { selectServer(x.id); location.hash = '#/dashboard'; } }, 'Open'),
-        (() => { const b = h('button', { class: 'sm' }, 'Test'); b.onclick = act(b, async () => { const r = await api('/api/servers/test', { method: 'POST', body: { id: x.id } }); toast(`${x.name}: OK in ${r.latencyMs} ms — ${r.os || 'Linux'}, user ${r.user}, sudo ${r.sudo ? 'available' : 'NOT available'}`, !r.sudo); load().then(render); }); return b; })(),
-        h('button', { class: 'sm', onclick: () => editServerDialog(x) }, 'Edit'),
-        h('button', { class: 'sm danger', onclick: async () => { if (await confirmDialog('Remove server?', `${x.name} will be removed from the panel and its stored SSH key deleted. The server itself is not touched.`, 'Remove')) try { await api('/api/servers?id=' + encodeURIComponent(x.id), { method: 'DELETE' }); await loadServers(); render(); } catch (e) { fail(e); } } }, 'Remove')),
+        (() => { const b = h('button', { class: 'sm', cmd: `ssh ${x.username}@${x.host} -p ${x.port} true   # opens an SSH connection and measures the delay` }, 'Test'); b.onclick = act(b, async () => { const r = await api('/api/servers/test', { method: 'POST', body: { id: x.id } }); toast(`${x.name}: OK in ${r.latencyMs} ms — ${r.os || 'Linux'}, user ${r.user}, sudo ${r.sudo ? 'available' : 'NOT available'}`, !r.sudo); load().then(render); }); return b; })(),
+        h('button', { class: 'sm', cmd: 'panel: edit the saved connection details', onclick: () => editServerDialog(x) }, 'Edit'),
+        h('button', { class: 'sm danger', cmd: 'panel: forgets this server and its stored key. Nothing is changed on the server itself.', onclick: async () => { if (await confirmDialog('Remove server?', `${x.name} will be removed from the panel and its stored SSH key deleted. The server itself is not touched.`, 'Remove')) try { await api('/api/servers?id=' + encodeURIComponent(x.id), { method: 'DELETE' }); await loadServers(); render(); } catch (e) { fail(e); } } }, 'Remove')),
     }) : h('div', { class: 'empty' }, 'No servers yet. Add one to get started.'));
   }
   load().catch(fail);
@@ -999,9 +1028,9 @@ function pageUsers() {
       columns: [{ key: 'username', label: 'Username' }, { key: 'role', label: 'Role', render: (u) => h('span', { class: 'badge ' + (u.role === 'admin' ? 'warn' : '') }, u.role) }, { key: 'totp', label: '2-step', render: (u) => (u.totp ? h('span', { class: 'badge ok' }, 'on') : h('span', { class: 'muted' }, 'off')) }, { key: 'created', label: 'Created', render: (u) => fmt.date(Date.parse(u.created)) }],
       rows: r.users,
       rowActions: (u) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        h('button', { class: 'sm', onclick: async () => { const pw = await promptDialog(`New password for ${u.username}`, 'At least 10 characters', '', { type: 'password' }); if (pw) try { await api('/api/users/password', { method: 'POST', body: { id: u.id, password: pw } }); toast('Password updated'); } catch (e) { fail(e); } } }, 'Reset password'),
-        u.totp ? h('button', { class: 'sm', onclick: async () => { if (await confirmDialog('Turn off two-step verification?', `${u.username} will sign in with the password only until they set it up again, and is signed out everywhere.`, 'Turn off')) try { await api('/api/users/2fa/reset', { method: 'POST', body: { id: u.id } }); toast('Two-step verification reset'); load(); } catch (e) { fail(e); } } }, 'Reset 2-step') : null,
-        u.id === state.user.id ? null : h('button', { class: 'sm danger', onclick: async () => { if (await confirmDialog('Delete user?', u.username, 'Delete')) try { await api('/api/users?id=' + encodeURIComponent(u.id), { method: 'DELETE' }); load(); } catch (e) { fail(e); } } }, 'Delete')),
+        h('button', { class: 'sm', cmd: 'panel: changes this panel account only', onclick: async () => { const pw = await promptDialog(`New password for ${u.username}`, 'At least 10 characters', '', { type: 'password' }); if (pw) try { await api('/api/users/password', { method: 'POST', body: { id: u.id, password: pw } }); toast('Password updated'); } catch (e) { fail(e); } } }, 'Reset password'),
+        u.totp ? h('button', { class: 'sm', cmd: 'panel: removes this account\'s second sign-in step', onclick: async () => { if (await confirmDialog('Turn off two-step verification?', `${u.username} will sign in with the password only until they set it up again, and is signed out everywhere.`, 'Turn off')) try { await api('/api/users/2fa/reset', { method: 'POST', body: { id: u.id } }); toast('Two-step verification reset'); load(); } catch (e) { fail(e); } } }, 'Reset 2-step') : null,
+        u.id === state.user.id ? null : h('button', { class: 'sm danger', cmd: 'panel: deletes this panel account', onclick: async () => { if (await confirmDialog('Delete user?', u.username, 'Delete')) try { await api('/api/users?id=' + encodeURIComponent(u.id), { method: 'DELETE' }); load(); } catch (e) { fail(e); } } }, 'Delete')),
     }));
   }
   function add() {
@@ -1012,7 +1041,7 @@ function pageUsers() {
     });
   }
   load().catch(fail);
-  return h('div', {}, pageHeader('Users', 'Viewers can monitor; admins can change things', h('button', { class: 'primary', onclick: add }, 'Add user')), box);
+  return h('div', {}, pageHeader('Users', 'Viewers can monitor; admins can change things', h('button', { class: 'primary', cmd: 'panel: creates a panel account', onclick: add }, 'Add user')), box);
 }
 
 // ---------------------------------------------------------------- audit

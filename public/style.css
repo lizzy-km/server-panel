@@ -178,3 +178,16 @@ details.adv { margin: 4px 0 12px; } details.adv summary { cursor: pointer; color
 .fw-card .m { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
 .fw-card.sel { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent) inset; background: var(--panel2); }
 .req { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 12px; }
+
+/* command tooltips */
+.cmdtip { position: fixed; z-index: 1000; max-width: min(460px, calc(100vw - 16px)); background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 8px 11px; box-shadow: 0 8px 24px rgba(0,0,0,.35); pointer-events: none; }
+.cmdtip-head { font: 600 11px/1.3 system-ui, sans-serif; color: #94a3b8; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+.cmdtip-body { font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+[data-cmd] { cursor: pointer; }
+
+/* cheat sheet */
+.cs-row { display: grid; grid-template-columns: minmax(260px, 1.2fr) 1.4fr auto; gap: 10px 16px; align-items: start; padding: 8px 0; border-top: 1px solid var(--border, #e5e7eb); }
+.cs-cmd code { display: block; background: var(--panel2); border-radius: 6px; padding: 6px 9px; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; }
+.cs-desc { font-size: 13.5px; padding-top: 4px; }
+.cs-actions { display: flex; gap: 6px; padding-top: 2px; }
+@media (max-width: 800px) { .cs-row { grid-template-columns: 1fr; } }

@@ -1,6 +1,10 @@
 'use strict';
 /* Databases: MariaDB / PostgreSQL on the server. Everything is a button: install, create, users, access, export, import, drop. */
 
+/** How the panel talks to the database: SQL goes in on stdin (so passwords never appear in a process list). */
+const sqlCmd = (engine, sql) => (engine === 'mysql' ? `mysql <<< "${sql}"` : `sudo -u postgres psql -v ON_ERROR_STOP=1 <<< "${sql}"`);
+const dumpTip = (engine, db) => (engine === 'mysql' ? `mysqldump --single-transaction --routines --triggers ${db} | gzip > <exports folder>/${db}-<time>.sql.gz` : `sudo -u postgres pg_dump --no-owner --clean --if-exists ${db} | gzip > <exports folder>/${db}-<time>.sql.gz`);
+
 function pageDatabases() {
   const root = h('div', {});
   const body = h('div', {});
@@ -27,7 +31,7 @@ function pageDatabases() {
 
   function installCard(e) {
     const tool = e.engine === 'mysql' ? 'mariadb' : 'postgresql';
-    const btn = h('button', { class: 'primary' }, `Install ${e.label}`);
+    const btn = h('button', { class: 'primary', cmd: e.engine === 'mysql' ? 'dnf -y install mariadb1011-server mariadb1011\nsystemctl enable --now mariadb' : 'dnf -y install postgresql16-server postgresql16\npostgresql-setup --initdb\nsystemctl enable --now postgresql' }, `Install ${e.label}`);
     btn.onclick = act(btn, async () => {
       const r = await api('/api/provision/install', { method: 'POST', body: { tools: [tool] } });
       logModal(`Installing ${e.label}`, { url: `/api/jobs/log?id=${r.id}`, onDone: () => { status = null; paint().catch(fail); } });
@@ -39,7 +43,7 @@ function pageDatabases() {
   async function loadOverview(box, e) {
     const ov = await api(`/api/db/overview?engine=${engine}`);
     const reload = () => { status = null; paint().catch(fail); };
-    const create = h('button', { class: 'primary', onclick: () => createDialog(engine, reload) }, 'New database');
+    const create = h('button', { class: 'primary', cmd: 'panel: opens the form. Nothing runs until you press Create.', onclick: () => createDialog(engine, reload) }, 'New database');
     const imp = null;
     box.replaceChildren(
       h('div', { class: 'card' }, h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('h2', {}, `Databases (${ov.databases.length})`), create),
@@ -51,12 +55,12 @@ function pageDatabases() {
           ],
           rows: ov.databases, empty: 'No databases yet.',
           rowActions: (x) => (x.system ? null : h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-            h('button', { class: 'sm', onclick: () => exportDialog(engine, x.name) }, 'Export'),
-            h('button', { class: 'sm', onclick: () => importDialog(engine, x.name, reload) }, 'Import'),
-            h('button', { class: 'sm', onclick: () => useInAppDialog(engine, x.name, ov.users) }, 'Use in app'),
-            h('button', { class: 'sm danger', onclick: () => dropDb(engine, x.name, reload) }, 'Drop'))),
+            h('button', { class: 'sm', cmd: `${dumpTip(engine, x.name)}\ngzip -t <that file>   # checks it is readable`, onclick: () => exportDialog(engine, x.name) }, 'Export'),
+            h('button', { class: 'sm', cmd: `panel: opens the import form (the current contents are exported first)`, onclick: () => importDialog(engine, x.name, reload) }, 'Import'),
+            h('button', { class: 'sm', cmd: 'panel: opens the form that writes DB_HOST, DB_DATABASE, DB_USERNAME, DB_PASSWORD into an app’s .env', onclick: () => useInAppDialog(engine, x.name, ov.users) }, 'Use in app'),
+            h('button', { class: 'sm danger', cmd: engine === 'mysql' ? sqlCmd(engine, `DROP DATABASE \`${x.name}\`;`) : sqlCmd(engine, `DROP DATABASE "${x.name}" WITH (FORCE);`), onclick: () => dropDb(engine, x.name, reload) }, 'Drop'))),
         })),
-      h('div', { class: 'card' }, h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('h2', {}, `Users (${ov.users.length})`), h('button', { onclick: () => userDialog(engine, ov, reload) }, 'New user')),
+      h('div', { class: 'card' }, h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('h2', {}, `Users (${ov.users.length})`), h('button', { cmd: 'panel: opens the form. Nothing runs until you press Create user.', onclick: () => userDialog(engine, ov, reload) }, 'New user')),
         dataTable({
           columns: [
             { key: 'name', label: 'User', render: (x) => h('span', {}, x.name, x.system ? h('span', { class: 'badge', style: { marginLeft: '6px' } }, 'system') : null) },
@@ -65,9 +69,9 @@ function pageDatabases() {
           ],
           rows: ov.users, empty: 'No users.',
           rowActions: (x) => (x.system ? null : h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-            h('button', { class: 'sm', onclick: () => accessDialog(engine, x, ov.databases, reload) }, 'Access'),
-            h('button', { class: 'sm', onclick: () => resetPw(engine, x.name) }, 'New password'),
-            h('button', { class: 'sm danger', onclick: () => dropUser(engine, x.name, reload) }, 'Delete'))),
+            h('button', { class: 'sm', cmd: engine === 'mysql' ? 'panel: pick databases. Runs GRANT ALL PRIVILEGES ON <db>.* TO / REVOKE ALL PRIVILEGES ON <db>.* FROM this user' : 'panel: pick databases. Runs GRANT ALL ON DATABASE <db> TO / REVOKE ... FROM this user', onclick: () => accessDialog(engine, x, ov.databases, reload) }, 'Access'),
+            h('button', { class: 'sm', cmd: engine === 'mysql' ? sqlCmd(engine, `ALTER USER '${x.name}'@'localhost' IDENTIFIED BY '<generated password>';`) : sqlCmd(engine, `ALTER ROLE "${x.name}" WITH PASSWORD '<generated password>';`), onclick: () => resetPw(engine, x.name) }, 'New password'),
+            h('button', { class: 'sm danger', cmd: engine === 'mysql' ? sqlCmd(engine, `DROP USER '${x.name}'@'localhost';`) : sqlCmd(engine, `DROP OWNED BY "${x.name}"; DROP ROLE "${x.name}";`), onclick: () => dropUser(engine, x.name, reload) }, 'Delete'))),
         })),
       exportsNote(imp));
   }
@@ -88,7 +92,7 @@ function createDialog(engine, done) {
   const withUser = h('input', { type: 'checkbox', checked: true });
   const user = h('input', { placeholder: 'same as the database', autocomplete: 'off' });
   const err = h('div', { class: 'alert crit hidden', role: 'alert' });
-  const go = h('button', { class: 'primary' }, 'Create');
+  const go = h('button', { class: 'primary', cmd: engine === 'mysql' ? sqlCmd(engine, "CREATE DATABASE `<name>` CHARACTER SET utf8mb4;\nCREATE USER '<user>'@'localhost' IDENTIFIED BY '<generated password>';\nGRANT ALL PRIVILEGES ON `<name>`.* TO '<user>'@'localhost';") : sqlCmd(engine, 'CREATE ROLE "<user>" LOGIN PASSWORD \'<generated password>\';\nCREATE DATABASE "<name>" OWNER "<user>";\nREVOKE ALL ON DATABASE "<name>" FROM PUBLIC;') }, 'Create');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     try {
@@ -110,7 +114,7 @@ function userDialog(engine, ov, done) {
   const name = h('input', { autocomplete: 'off' });
   const db = h('select', {}, h('option', { value: '' }, 'No database yet'), ...ov.databases.filter((d) => !d.system).map((d) => h('option', { value: d.name }, d.name)));
   const err = h('div', { class: 'alert crit hidden', role: 'alert' });
-  const go = h('button', { class: 'primary' }, 'Create user');
+  const go = h('button', { class: 'primary', cmd: engine === 'mysql' ? sqlCmd(engine, "CREATE USER '<user>'@'localhost' IDENTIFIED BY '<generated password>';") : sqlCmd(engine, 'CREATE ROLE "<user>" LOGIN PASSWORD \'<generated password>\';') }, 'Create user');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     try {
@@ -126,7 +130,7 @@ function userDialog(engine, ov, done) {
 function accessDialog(engine, user, databases, done) {
   const rows = databases.filter((d) => !d.system).map((d) => {
     const has = user.databases.includes(d.name);
-    const b = h('button', { class: 'sm' + (has ? ' danger' : '') }, has ? 'Remove access' : 'Give access');
+    const b = h('button', { class: 'sm' + (has ? ' danger' : ''), cmd: engine === 'mysql' ? sqlCmd(engine, has ? `REVOKE ALL PRIVILEGES ON \`${d.name}\`.* FROM '${user.name}'@'localhost';` : `GRANT ALL PRIVILEGES ON \`${d.name}\`.* TO '${user.name}'@'localhost';`) : sqlCmd(engine, has ? `REVOKE ALL ON DATABASE "${d.name}" FROM "${user.name}";` : `GRANT ALL ON DATABASE "${d.name}" TO "${user.name}";`) }, has ? 'Remove access' : 'Give access');
     b.onclick = act(b, async () => { await api('/api/db/grant', { method: 'POST', body: { engine, user: user.name, database: d.name, action: has ? 'revoke' : 'grant' } }); toast(has ? 'Access removed' : 'Access granted'); close(); done(); });
     return h('div', { class: 'row', style: { justifyContent: 'space-between', padding: '4px 0' } }, h('span', {}, d.name, has ? h('span', { class: 'badge ok', style: { marginLeft: '6px' } }, 'has access') : null), b);
   });
@@ -141,7 +145,7 @@ async function resetPw(engine, name) {
 async function typedConfirm(title, message, expected, label) {
   return new Promise((resolve) => {
     const input = h('input', { autocomplete: 'off', placeholder: expected });
-    const ok = h('button', { class: 'danger', disabled: true }, label);
+    const ok = h('button', { class: 'danger', disabled: true, cmd: 'panel: runs the drop/delete only after the name is typed correctly' }, label);
     input.oninput = () => { ok.disabled = input.value !== expected; };
     let done = false;
     const close = modal(title, h('div', {}, h('p', {}, message), h('div', { class: 'field' }, h('label', {}, `Type ${expected} to confirm`), input),
@@ -173,7 +177,7 @@ function importDialog(engine, name, done) {
   const file = h('input', { type: 'file', accept: '.sql,.gz,.sql.gz' });
   const confirm = h('input', { autocomplete: 'off', placeholder: name });
   const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-  const go = h('button', { class: 'danger' }, 'Replace database with this file');
+  const go = h('button', { class: 'danger', cmd: (engine === 'mysql' ? 'mysqldump ... | gzip > <safety copy>   # saved first\nmysql -e "DROP DATABASE <db>; CREATE DATABASE <db>"\ngunzip -c <your file> | mysql <db>' : 'pg_dump ... | gzip > <safety copy>   # saved first\nsudo -u postgres psql -c "DROP DATABASE <db> WITH (FORCE)" -c "CREATE DATABASE <db>"\ngunzip -c <your file> | sudo -u postgres psql -d <db>') + '\n# if loading fails the safety copy is restored automatically' }, 'Replace database with this file');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     const f = file.files[0];
@@ -199,7 +203,7 @@ async function useInAppDialog(engine, database, users) {
   const user = h('select', {}, users.filter((u) => !u.system).map((u) => h('option', { value: u.name, selected: u.databases.includes(database) }, u.name)));
   const pw = h('input', { type: 'password', autocomplete: 'off', placeholder: 'that user’s password' });
   const err = h('div', { class: 'alert crit hidden', role: 'alert' });
-  const go = h('button', { class: 'primary' }, 'Write settings');
+  const go = h('button', { class: 'primary', cmd: 'panel: writes DB_CONNECTION, DB_HOST, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD, DATABASE_URL into the app’s environment (Laravel: its .env file)' }, 'Write settings');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     try {

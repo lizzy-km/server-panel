@@ -2,13 +2,20 @@
 /* Laravel (PHP) apps: adopt an existing install, then manage it (status, artisan, .env, logs). Uses helpers from deploy.js. */
 
 // ---------------------------------------------------------------- adopt dialog
+/** The exact command the panel runs for an artisan button. */
+function artisanCmd(app, command) {
+  const args = command === 'migrate' ? 'migrate --force' : command;
+  const inner = `cd ${app.path} && php artisan ${args} --no-interaction`;
+  return app.runUser ? `sudo -u ${app.runUser} sh -c '${inner}'` : inner;
+}
+
 function adoptLaravelDialog(onAdopted, suggestions = []) {
   const name = h('input', { placeholder: 'q-app', value: 'q-app' });
   const path = h('input', { placeholder: '/var/www/q-app', value: (suggestions[0] && suggestions[0]) || '' });
   const result = h('div', { style: { marginTop: '10px' } });
   const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-  const detect = h('button', {}, 'Check folder');
-  const adopt = h('button', { class: 'primary', disabled: true }, 'Add this app');
+  const detect = h('button', { cmd: 'test -d <folder>; test -f <folder>/artisan; php -v; git -C <folder> log -1; cat <folder>/.env | grep (only APP_ENV, DB_CONNECTION ... names)   # only reads, changes nothing' }, 'Check folder');
+  const adopt = h('button', { class: 'primary', disabled: true, cmd: 'panel: remembers this folder. Nothing is moved, rewritten or restarted on the server.' }, 'Add this app');
   const show = (m) => { err.textContent = m || ''; err.classList.toggle('hidden', !m); };
   const field = (label, el, hint) => h('div', { class: 'field' }, h('label', {}, label), el, hint ? h('div', { class: 'muted', style: { fontSize: '12px' } }, hint) : null);
 
@@ -66,7 +73,7 @@ function laravelCard(onChange) {
     const r = await api('/api/laravel');
     if (isAdminUser()) { try { suggestions = (await api('/api/nginx/discover')).sites.map((s) => s.laravelPath).filter(Boolean); } catch { suggestions = []; } }
     const apps = r.apps;
-    box.replaceChildren(h('h2', {}, `PHP / Laravel apps (${apps.length})`, isAdminUser() ? h('button', { class: 'sm primary', onclick: () => adoptLaravelDialog((a) => { location.hash = `#/deploy/laravel/${a.id}`; }, [...new Set(suggestions)]) }, 'Add existing app') : null),
+    box.replaceChildren(h('h2', {}, `PHP / Laravel apps (${apps.length})`, isAdminUser() ? h('button', { class: 'sm primary', cmd: 'panel: opens the form to add an existing app', onclick: () => adoptLaravelDialog((a) => { location.hash = `#/deploy/laravel/${a.id}`; }, [...new Set(suggestions)]) }, 'Add existing app') : null),
       apps.length ? dataTable({
         columns: [
           { key: 'name', label: 'App', render: (x) => h('a', { href: `#/deploy/laravel/${x.id}` }, x.name) },
@@ -105,12 +112,12 @@ function pageLaravelDetail(id) {
 
   function drawHead() {
     const { app, info } = data;
-    const btn = (label, fn, cls = '') => { const b = h('button', { class: cls }, label); b.onclick = act(b, fn); return b; };
+    const btn = (label, fn, cls = '', cmd = '') => { const b = h('button', { class: cls, cmd: cmd || undefined }, label); b.onclick = act(b, fn); return b; };
     head.replaceChildren(h('div', { class: 'muted', style: { marginBottom: '6px' } }, h('a', { href: '#/deploy' }, '← All apps')),
       pageHeader(app.name, `${app.path}${data.sites.length ? ' · ' + data.sites.map((s) => s.domain).join(', ') : ''}`,
         h('span', { class: 'badge' }, `Laravel ${info.laravel || '?'}`), h('span', { class: 'badge' }, `PHP ${info.php || '?'}`),
         info.maintenance ? h('span', { class: 'badge warn' }, 'maintenance mode') : h('span', { class: 'badge ok' }, 'live'),
-        admin ? btn(info.maintenance ? 'Go live' : 'Maintenance mode', async () => { const r = await run(info.maintenance ? 'up' : 'down', info.maintenance ? {} : { confirm: { title: 'Enable maintenance mode?', text: 'Visitors will see a 503 “be right back” page until you switch it off.', label: 'Enable' } }); if (r) toast(r.ok ? (info.maintenance ? 'App is live' : 'Maintenance mode on') : r.output, !r.ok); drawTabs(); }, info.maintenance ? 'primary' : '') : null));
+        admin ? btn(info.maintenance ? 'Go live' : 'Maintenance mode', async () => { const r = await run(info.maintenance ? 'up' : 'down', info.maintenance ? {} : { confirm: { title: 'Enable maintenance mode?', text: 'Visitors will see a 503 “be right back” page until you switch it off.', label: 'Enable' } }); if (r) toast(r.ok ? (info.maintenance ? 'App is live' : 'Maintenance mode on') : r.output, !r.ok); drawTabs(); }, info.maintenance ? 'primary' : '', artisanCmd(app, info.maintenance ? 'up' : 'down')) : null));
   }
 
   function drawTabs() {
@@ -145,8 +152,8 @@ function pageLaravelDetail(id) {
       const r = await run(cmd, danger ? { confirm: { title: 'Run migrations?', text: 'Applies all pending database migrations (migrate --force). Take a database backup first if this is production.', label: 'Run migrations' } } : {});
       if (r) out.textContent = `$ php artisan ${cmd}   (${r.ms} ms, ${r.ok ? 'ok' : 'FAILED'})\n\n${r.output || '(no output)'}`; else out.textContent = 'Cancelled.';
     };
-    const fpm = (action) => { const b = h('button', {}, action === 'reload' ? 'Reload PHP-FPM' : 'Restart PHP-FPM'); b.onclick = act(b, async () => { if (action === 'restart' && !(await confirmDialog('Restart PHP-FPM?', 'Requests in flight are interrupted for a moment.', 'Restart'))) return; await api('/api/laravel/fpm', { method: 'POST', body: { id, action } }); toast(`PHP-FPM ${action}ed`); }); return b; };
-    return h('div', {}, h('div', { class: 'two' }, groups.map(([title, items]) => h('div', { class: 'card' }, h('h2', {}, title), h('div', { class: 'row' }, items.map(([cmd, label, cls]) => { const b = h('button', { class: cls === 'danger' ? 'danger' : '', title: `php artisan ${cmd}` }, label); b.onclick = act(b, () => exec(cmd, label, cls === 'danger')); return b; }))))),
+    const fpm = (action) => { const b = h('button', { cmd: `systemctl ${action} ${data.app.fpmUnit || 'php-fpm'}` }, action === 'reload' ? 'Reload PHP-FPM' : 'Restart PHP-FPM'); b.onclick = act(b, async () => { if (action === 'restart' && !(await confirmDialog('Restart PHP-FPM?', 'Requests in flight are interrupted for a moment.', 'Restart'))) return; await api('/api/laravel/fpm', { method: 'POST', body: { id, action } }); toast(`PHP-FPM ${action}ed`); }); return b; };
+    return h('div', {}, h('div', { class: 'two' }, groups.map(([title, items]) => h('div', { class: 'card' }, h('h2', {}, title), h('div', { class: 'row' }, items.map(([cmd, label, cls]) => { const b = h('button', { class: cls === 'danger' ? 'danger' : '', cmd: artisanCmd(data.app, cmd) }, label); b.onclick = act(b, () => exec(cmd, label, cls === 'danger')); return b; }))))),
       h('div', { class: 'card', style: { marginTop: '14px' } }, h('h2', {}, 'PHP-FPM', h('span', { class: 'muted' }, data.app.fpmUnit)), h('div', { class: 'row' }, fpm('reload'), fpm('restart')), h('div', { class: 'muted', style: { marginTop: '8px', fontSize: '12.5px' } }, 'Reload after changing PHP code or php.ini so OPcache picks it up.')),
       h('div', { style: { marginTop: '14px' } }, out),
       h('div', { class: 'muted', style: { marginTop: '8px', fontSize: '12px' } }, 'Only a fixed list of safe commands can be run. Destructive ones (migrate:fresh, rollback, db:wipe, db:seed) are deliberately not available.'));
@@ -156,9 +163,9 @@ function pageLaravelDetail(id) {
     const card = h('div', { class: 'card' });
     const area = h('textarea', { class: 'editor', rows: 18, spellcheck: false, disabled: true, style: { minHeight: '300px', whiteSpace: 'pre' }, placeholder: 'Values are hidden until you click “Reveal & edit”.' });
     const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-    const reveal = h('button', { class: 'primary' }, 'Reveal & edit');
-    const save = h('button', { class: 'hidden' }, 'Save');
-    const apply = h('button', { class: 'primary hidden' }, 'Save & apply');
+    const reveal = h('button', { class: 'primary', cmd: 'cat <app>/.env   # shown to you only, recorded in the audit log' }, 'Reveal & edit');
+    const save = h('button', { class: 'hidden', cmd: 'cp <app>/.env <app>/.env.bak   # backup\ntee <app>/.env   # writes your text (APP_KEY is protected)' }, 'Save');
+    const apply = h('button', { class: 'primary hidden', cmd: 'tee <app>/.env   # writes your text\nphp artisan config:clear; php artisan queue:restart   # so the app and workers read it' }, 'Save & apply');
     const cancel = h('button', { class: 'hidden' }, 'Cancel');
     const show = (m) => { err.textContent = m || ''; err.classList.toggle('hidden', !m); };
     const lock = () => { area.disabled = true; area.value = ''; for (const b of [save, apply, cancel]) b.classList.add('hidden'); reveal.classList.remove('hidden'); show(''); };
@@ -201,12 +208,12 @@ function pageLaravelDetail(id) {
     }
     api(`/api/laravel/logfiles?id=${id}`).then((r) => { file.replaceChildren(...r.files.map((f) => h('option', { value: f.name }, `${f.name} (${fmt.bytes(f.size)})`))); if (!r.files.length) out.textContent = 'No log files in storage/logs yet.'; refresh(); }).catch((e) => { out.textContent = e.message; });
     poll(() => (follow.checked ? refresh() : null), 3000);
-    return h('div', {}, h('div', { class: 'toolbar' }, file, lines, filter, h('label', { class: 'row' }, follow, 'Follow'), h('button', { onclick: refresh }, 'Refresh')), out);
+    return h('div', {}, h('div', { class: 'toolbar' }, file, lines, filter, h('label', { class: 'row' }, follow, 'Follow'), h('button', { cmd: 'tail -c <size> <app>/storage/logs/<chosen log file>', onclick: refresh }, 'Refresh')), out);
   }
 
   function settings() {
     const { app } = data;
-    const forget = h('button', { class: 'danger' }, 'Remove from panel…');
+    const forget = h('button', { class: 'danger', cmd: 'panel: forgets this app. The app, its files and its nginx site stay exactly as they are.' }, 'Remove from panel…');
     forget.onclick = async () => { if (await confirmDialog('Remove from the panel?', `${app.name} is only forgotten here. The app, its files and its nginx site stay exactly as they are.`, 'Remove')) try { await api(`/api/laravel?id=${id}`, { method: 'DELETE' }); toast('Removed from the panel'); location.hash = '#/deploy'; } catch (e) { fail(e); } };
     return h('div', { class: 'card' }, kv([['Name', app.name], ['Folder', h('code', {}, app.path)], ['artisan runs as', app.runUser || 'the SSH user'], ['PHP-FPM service', app.fpmUnit], ['Added', `${fmt.date(Date.parse(app.created))} by ${app.createdBy}`]]),
       admin ? h('div', { style: { marginTop: '14px' } }, forget) : null);

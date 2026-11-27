@@ -143,6 +143,10 @@ Remember that on AWS the instance's Security Group is the first firewall: keep i
 
 The nginx configuration follows the app: its framework and the folder it lives in (`/var/www`, `/srv/apps`, anything). Next.js and Nuxt fingerprinted build files are cached for a year; React/Vue/Angular builds never cache `index.html`; Spring Boot and .NET get larger proxy buffers and forwarded-host headers; Laravel hides the PHP version; WordPress blocks PHP in uploads. For existing folders, **Check folder** looks inside and picks the right web root (Laravel's `public/`, a build's `dist/`, WordPress, plain PHP) and tells you if it is a Node app that needs a port instead. After saving, the panel warns if the nginx user cannot enter a parent folder (the usual cause of 403 errors).
 
+## Cheat sheet and "what does this button run?"
+
+Hover (or keyboard-focus) any button that acts on the server and a tooltip shows the exact commands it runs, for example `systemctl restart nginx` or the whole deploy sequence for an app. Buttons that only change the panel say so. The **Cheat sheet** page lists 190+ commands for Amazon Linux 2023 in 20 sections (system, services, logs, files, permissions, network, firewall, SSH, dnf, nginx, HTTPS, PHP/Laravel, Node/Java/.NET/Go/Python, Docker, Git, databases, backups, cron, security, troubleshooting recipes and where the panel keeps its files). It is searchable, marks risky commands, links to the panel page that does the same with a button, and can copy a command or open it in the Terminal page.
+
 ## Install the panel on Amazon Linux 2023
 
 ```bash

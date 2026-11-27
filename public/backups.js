@@ -25,7 +25,7 @@ function pageBackups() {
   const root = h('div', {});
   const box = h('div', {});
   let apps = []; let data = null;
-  root.append(pageHeader('Backups', `Databases, app data and folders on ${(currentServer() || {}).name || 'this server'}`, h('button', { class: 'primary', onclick: () => jobDialog(null, apps, data, load) }, 'New backup')), box);
+  root.append(pageHeader('Backups', `Databases, app data and folders on ${(currentServer() || {}).name || 'this server'}`, h('button', { class: 'primary', cmd: 'panel: opens the form. Nothing runs until you save the job.', onclick: () => jobDialog(null, apps, data, load) }, 'New backup')), box);
 
   async function load() {
     const [d, a] = await Promise.all([api('/api/backups'), api('/api/apps').catch(() => ({ apps: [] }))]);
@@ -40,10 +40,10 @@ function pageBackups() {
       ],
       rows: d.jobs, empty: '',
       rowActions: (j) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        h('button', { class: 'sm primary', disabled: j.running, onclick: () => runNow(j) }, j.running ? 'Running…' : 'Back up now'),
-        h('button', { class: 'sm', onclick: () => historyDialog(j, load) }, 'Backups'),
-        h('button', { class: 'sm', onclick: () => jobDialog(j, apps, d, load) }, 'Edit'),
-        h('button', { class: 'sm danger', onclick: () => deleteJob(j, load) }, 'Delete')),
+        h('button', { class: 'sm primary', disabled: j.running, cmd: `bash /opt/panel-backups/${j.id}.sh   # the same script the timer runs\nmysqldump / pg_dump <db> | gzip > .../<time>/db-<engine>-<db>.sql.gz   # per database\ntar -czf .../<time>/files-N.tar.gz -C / <folder>   # per folder\ngzip -t / tar -tzf   # verifies every file\naws s3 cp ... --recursive   # only if S3 is on\n# then removes backups beyond the newest ${j.keep}`, onclick: () => runNow(j) }, j.running ? 'Running…' : 'Back up now'),
+        h('button', { class: 'sm', cmd: 'cat <backup folder>/*/manifest.json   # reads the results each run wrote', onclick: () => historyDialog(j, load) }, 'Backups'),
+        h('button', { class: 'sm', cmd: 'panel: opens the job settings. Saving rewrites the script and timer on the server.', onclick: () => jobDialog(j, apps, d, load) }, 'Edit'),
+        h('button', { class: 'sm danger', cmd: `systemctl disable --now panel-backup-${j.id}.timer\nrm /etc/systemd/system/panel-backup-${j.id}.{timer,service} /opt/panel-backups/${j.id}.sh\nrm -rf <backup folder>/${j.id}   # only if you choose to delete the files`, onclick: () => deleteJob(j, load) }, 'Delete')),
     }) : h('div', { class: 'empty' }, 'No backup jobs yet. Create one to protect your databases and files, then schedule it so it runs by itself.')),
     h('p', { class: 'muted', style: { fontSize: '12.5px' } }, `Backups are stored on the server in ${d.defaults.root} and scheduled with systemd timers on the server itself, so they keep running even when this panel is closed. Restoring a database replaces it after saving a safety copy; restoring files goes to a separate folder unless you choose to overwrite.`));
   }
@@ -61,7 +61,7 @@ async function runNow(j) {
 
 async function deleteJob(j, done) {
   const files = await new Promise((resolve) => {
-    const keep = h('button', {}, 'Delete job, keep backup files'); const all = h('button', { class: 'danger' }, 'Delete job and its backup files');
+    const keep = h('button', { cmd: 'systemctl disable --now panel-backup-<id>.timer; rm the timer, service and script files' }, 'Delete job, keep backup files'); const all = h('button', { class: 'danger', cmd: 'systemctl disable --now panel-backup-<id>.timer; rm the timer, service and script files\nrm -rf <backup folder>/<id>' }, 'Delete job and its backup files');
     const close = modal(`Delete ${j.name}?`, h('div', {}, h('p', {}, 'The schedule stops. Existing backups can stay on the server or be deleted too.'), h('div', { class: 'actions' }, h('button', { onclick: () => { close(); resolve(null); } }, 'Cancel'), keep, all)));
     keep.onclick = () => { close(); resolve(false); }; all.onclick = () => { close(); resolve(true); };
   });
@@ -104,7 +104,7 @@ async function jobDialog(job, apps, data, done) {
     h('div', { class: 'grid2' }, field('Access key ID', s3.accessKey), field('Secret access key', s3.secretKey, 'Stored encrypted. Use a key that can only write to this bucket.')));
   s3on.onchange = () => s3box.classList.toggle('hidden', !s3on.checked); s3box.classList.toggle('hidden', !s3on.checked);
 
-  const go = h('button', { class: 'primary' }, edit ? 'Save' : 'Create backup job');
+  const go = h('button', { class: 'primary', cmd: 'tee /opt/panel-backups/<id>.sh   # the backup script (mode 700)\ntee /etc/systemd/system/panel-backup-<id>.{service,timer}   # the schedule\nsystemctl daemon-reload; systemctl enable --now panel-backup-<id>.timer' }, edit ? 'Save' : 'Create backup job');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     const sources = [
@@ -143,12 +143,12 @@ async function historyDialog(job, done) {
     const { runs } = await api(`/api/backups/runs?id=${job.id}`);
     body.replaceChildren(runs.length ? h('div', {}, runs.map((m) => h('div', { class: 'card', style: { margin: '8px 0', padding: '10px' } },
       h('div', { class: 'row', style: { justifyContent: 'space-between' } }, h('span', {}, h('strong', {}, new Date(runDate(m.run)).toLocaleString()), ' ', runBadge(m), h('span', { class: 'muted' }, ` ${fmt.bytes(m.bytes || 0)}${m.uploaded === 'yes' ? ' · copied to S3' : ''}`)),
-        h('button', { class: 'sm danger', onclick: async () => { if (!(await confirmDialog('Delete this backup?', 'The files are removed from the server.', 'Delete'))) return; try { await api(`/api/backups/runs?id=${job.id}&run=${m.run}`, { method: 'DELETE' }); paint().catch(fail); } catch (e) { fail(e); } } }, 'Delete')),
+        h('button', { class: 'sm danger', cmd: 'rm -rf <backup folder>/<job>/<time>', onclick: async () => { if (!(await confirmDialog('Delete this backup?', 'The files are removed from the server.', 'Delete'))) return; try { await api(`/api/backups/runs?id=${job.id}&run=${m.run}`, { method: 'DELETE' }); paint().catch(fail); } catch (e) { fail(e); } } }, 'Delete')),
       h('div', {}, m.items.map((it) => h('div', { class: 'row', style: { justifyContent: 'space-between', padding: '3px 0', fontSize: '13px' } },
         h('span', {}, it.type === 'db' ? `Database ${it.source.split(':')[1]}` : it.source, it.status !== 'ok' ? h('span', { class: 'badge crit', style: { marginLeft: '6px' } }, `failed${it.error ? `: ${it.error}` : ''}`) : h('span', { class: 'muted' }, ` ${fmt.bytes(it.bytes)}`)),
         it.status === 'ok' ? h('span', { class: 'row', style: { flexWrap: 'nowrap' } },
           h('a', { class: 'btn sm', style: { textDecoration: 'none', fontSize: '12px', padding: '3px 9px' }, href: withServer(`/api/backups/download?id=${job.id}&run=${m.run}&file=${encodeURIComponent(it.file)}`) }, 'Download'),
-          h('button', { class: 'sm', onclick: () => restoreDialog(job, m, it) }, 'Restore…')) : null)))))) : h('div', { class: 'empty' }, 'No backups yet. Press “Back up now”.'));
+          h('button', { class: 'sm', cmd: 'panel: opens the restore options. Nothing runs until you confirm.', onclick: () => restoreDialog(job, m, it) }, 'Restore…')) : null)))))) : h('div', { class: 'empty' }, 'No backups yet. Press “Back up now”.'));
   }
   paint().catch(fail);
   return close;
@@ -162,7 +162,7 @@ function restoreDialog(job, m, it) {
   const confirm = h('input', { autocomplete: 'off', placeholder: target });
   const confirmBox = h('div', { class: 'field' }, h('label', {}, `Type ${target} to confirm`), confirm);
   const sync = () => confirmBox.classList.toggle('hidden', !isDb && mode.value !== 'inplace'); sync(); mode.onchange = sync;
-  const go = h('button', { class: 'danger' }, isDb ? 'Replace the database' : 'Restore');
+  const go = h('button', { class: 'danger', cmd: isDb ? 'mysqldump/pg_dump <db>   # safety copy first\ngunzip -c <backup file> | mysql <db>   # or psql, after dropping and recreating it\n# restored automatically if loading fails' : 'tar -xzf <backup file> -C <staging folder>   # safe: your live files are not touched\n# or, if you choose to overwrite:\ntar -czf <before-restore copy> -C / <folder>   # saved first\ntar -xzf <backup file> -C /' }, isDb ? 'Replace the database' : 'Restore');
   go.onclick = act(go, async () => {
     err.classList.add('hidden');
     try {

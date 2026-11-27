@@ -53,7 +53,7 @@ function kv(rows) {
 function phpSwitchBox(needs, installed, onStarted) {
   const ver = needs && /^8\.[2-4]$/.test(needs) ? needs : '8.4';
   const tool = { '8.2': 'php82', '8.3': 'php', '8.4': 'php84' }[ver];
-  const btn = h('button', { type: 'button', class: 'primary' }, `Install PHP ${ver} on this server`);
+  const btn = h('button', { type: 'button', class: 'primary', cmd: `dnf list --available php${ver}   # checked first, nothing is removed if it fails\ndnf -y remove 'php*'   # the current PHP\ndnf -y install php${ver} php${ver}-fpm php${ver}-cli ...\nsystemctl restart php-fpm` }, `Install PHP ${ver} on this server`);
   btn.onclick = async () => {
     if (!window.confirm(`Switch this server from PHP ${installed || 'current'} to PHP ${ver}?\n\nAmazon Linux keeps one PHP version at a time, so EVERY PHP site on this server will run on PHP ${ver} afterwards (PHP-FPM restarts briefly). The panel checks that PHP ${ver} is available first and changes nothing if it is not.`)) return;
     try {
@@ -64,6 +64,20 @@ function phpSwitchBox(needs, installed, onStarted) {
   return h('div', { class: 'card', style: { margin: '8px 0', padding: '10px' } },
     h('div', { style: { marginBottom: '6px' } }, `This app needs PHP ${ver} or newer, but this server has PHP ${installed || 'an older version'}.`),
     btn, h('div', { class: 'muted', style: { fontSize: '12.5px', marginTop: '6px' } }, 'Alternative: in your code add "config": { "platform": { "php": "8.3.0" } } to composer.json, run composer update, and commit composer.lock.'));
+}
+
+/** The real steps a deploy runs for this app (from its effective commands), for button tooltips. */
+function deployCmd(a) {
+  const e = a.effective || {}; const dir = `${a.baseDir}/${a.name}`;
+  const lines = [`git clone --depth 1 --branch ${a.branch} ${a.repoUrl.replace(/\/\/[^@/]*@/, '//')} ${dir}/releases/<new release>`];
+  if (a.mode === 'php') lines.push('composer check-platform-reqs --lock --no-dev   # does this server\'s PHP fit?');
+  const one = (c) => String(c || '').split('\n').map((x) => x.trim()).filter(Boolean);
+  for (const c of [...one(e.install), ...one(e.build)]) lines.push(c);
+  if (a.mode === 'php' && one(e.releaseCmd).length) lines.push(...one(e.releaseCmd).map((c) => `${c}   # release command`));
+  lines.push(`ln -sfn ${dir}/releases/<new release> ${dir}/current`);
+  lines.push(a.mode === 'service' ? `systemctl restart ${a.unit}   # then waits for ${a.healthPath || '/'} to answer` : a.mode === 'php' ? 'systemctl reload php-fpm   # then checks the site answers' : 'nginx serves the new files straight away');
+  lines.push(`# keeps the newest ${a.keepReleases} releases, removes older ones`);
+  return lines.join('\n');
 }
 
 /** Live log viewer for a deploy (id) or a provisioning job; polls until finished. */
@@ -148,7 +162,7 @@ function readinessCard() {
       return el;
     };
     box.replaceChildren(
-      h('h2', {}, 'Server readiness', isAdminUser() && missingCore.length ? h('button', { class: 'sm primary', onclick: () => installDialog(missingCore, load) }, 'Install missing…') : h('button', { class: 'sm', onclick: load }, 'Re-check')),
+      h('h2', {}, 'Server readiness', isAdminUser() && missingCore.length ? h('button', { class: 'sm primary', cmd: 'dnf -y install <the missing tools>   # you pick which ones in the next step', onclick: () => installDialog(missingCore, load) }, 'Install missing…') : h('button', { class: 'sm', cmd: 'node --version; git --version; php -v; java -version; dotnet --version; go version ...   # asks each tool for its version', onclick: load }, 'Re-check')),
       h('div', { class: 'chips' }, core.map((k) => chip(k, false)), h('span', { class: 'chip ' + (r.sudo === 'no' ? 'bad' : 'ok') }, r.sudo === 'no' ? '✕ passwordless sudo' : '✓ ' + (r.sudo === 'root' ? 'root' : 'sudo'))),
       h('div', { class: 'muted', style: { margin: '10px 0 6px', fontSize: '12.5px' } }, 'Runtimes for your apps (click a missing one to install it; the new-app form also offers this automatically):'),
       h('div', { class: 'chips' }, runtimes.map((k) => chip(k, true))),
@@ -164,7 +178,7 @@ function installDialog(missing, onFinished) {
   const boxes = Object.fromEntries(missing.map((t) => [t, h('input', { type: 'checkbox', checked: true })]));
   const body = h('div', {}, h('p', { class: 'muted' }, 'Installs with dnf on Amazon Linux 2023. This changes the server; nginx is started and enabled. Remember to open ports 80 and 443 in the instance’s security group.'),
     missing.map((t) => h('label', { class: 'row', style: { margin: '6px 0' } }, boxes[t], names[t])));
-  modal('Prepare server', body, { actions: [{ label: 'Cancel', onclick: (c) => c() }, { label: 'Install', cls: 'primary', onclick: async (c) => {
+  modal('Prepare server', body, { actions: [{ label: 'Cancel', onclick: (c) => c() }, { label: 'Install', cls: 'primary', cmd: 'dnf -y install <the ticked tools>\nsystemctl enable --now nginx   # if nginx is ticked', onclick: async (c) => {
     const tools = missing.filter((t) => boxes[t].checked);
     if (!tools.length) return;
     try { const r = await api('/api/provision/install', { method: 'POST', body: { tools } }); c(); logModal('Installing ' + tools.join(', '), { url: `/api/jobs/log?id=${r.id}`, onDone: onFinished }); } catch (e) { fail(e); }
@@ -265,7 +279,7 @@ function appForm(app, apps, presets, tools) {
   }
 
   // ---- detection
-  const detectBtn = h('button', { type: 'button' }, 'Detect framework from the repository');
+  const detectBtn = h('button', { type: 'button', cmd: 'git clone --depth 1 --branch <branch> <repo> /tmp/<temp>   # then looks for artisan, package.json, pom.xml ... and deletes the temp copy' }, 'Detect framework from the repository');
   const detectBox = h('div', {});
   const detectMsg = h('span', { class: 'muted', style: { marginLeft: '10px', fontSize: '12.5px' } });
   detectBtn.onclick = act(detectBtn, async () => {
@@ -330,7 +344,7 @@ async function newAppDialog(apps, onCreated) {
   try { tools = (await api('/api/provision/status')).tools; } catch { tools = null; }
   const form = appForm(null, apps, presets, tools);
   const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-  const create = h('button', { class: 'primary' }, 'Create app');
+  const create = h('button', { class: 'primary', cmd: 'panel: saves the app settings. Nothing runs on the server until you press Deploy.' }, 'Create app');
   const close = modal('New app', h('div', {}, err, form.el, h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Cancel'), create)), { wide: true });
   create.onclick = act(create, async () => {
     err.classList.add('hidden');
@@ -360,7 +374,7 @@ function pageDeploy() {
       ],
       rows: apps, empty: '',
       rowActions: (x) => h('span', { class: 'row', style: { justifyContent: 'flex-end', flexWrap: 'nowrap' } },
-        admin ? (() => { const b = h('button', { class: 'sm primary', disabled: x.deploying }, x.deploying ? 'Deploying…' : 'Deploy'); b.onclick = act(b, () => deployNow(x, load)); return b; })() : null,
+        admin ? (() => { const b = h('button', { class: 'sm primary', disabled: x.deploying, cmd: deployCmd(x) }, x.deploying ? 'Deploying…' : 'Deploy'); b.onclick = act(b, () => deployNow(x, load)); return b; })() : null,
         h('button', { class: 'sm', onclick: () => { location.hash = `#/deploy/${x.id}`; } }, 'Open')),
     }) : h('div', { class: 'empty' }, admin ? 'No apps yet. Create one to deploy a Node.js project from Git.' : 'No apps yet.'));
   }
@@ -395,13 +409,13 @@ function pageAppDetail(id) {
   function drawHead() {
     const { app, status } = data;
     const admin = isAdminUser();
-    const act1 = (label, fn, cls = '') => { const b = h('button', { class: cls }, label); b.onclick = act(b, fn); return b; };
+    const act1 = (label, fn, cls = '', cmd = '') => { const b = h('button', { class: cls, cmd: cmd || undefined }, label); b.onclick = act(b, fn); return b; };
     head.replaceChildren(h('div', { class: 'muted', style: { marginBottom: '6px' } }, h('a', { href: '#/deploy' }, '← All apps')),
       pageHeader(app.name, `${app.repoUrl.replace(/\.git$/, '')} @ ${app.branch}`,
         h('span', { class: 'badge ' + (['active', 'serving'].includes(status.active) ? 'ok' : ['inactive', 'failed', 'broken'].includes(status.active) ? 'bad' : '') }, app.mode === 'service' ? `service ${status.active}` : status.active),
-        admin ? act1('Deploy now', async () => { await deployNow(app, () => load()); }, 'primary') : null,
-        admin && app.mode === 'service' ? act1('Restart', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: 'restart' } }); toast('Restarted'); await load(false); drawHead(); }) : null,
-        admin && app.mode === 'service' ? act1(status.active === 'active' ? 'Stop' : 'Start', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: status.active === 'active' ? 'stop' : 'start' } }); await load(false); drawHead(); }, status.active === 'active' ? 'danger' : '') : null));
+        admin ? act1('Deploy now', async () => { await deployNow(app, () => load()); }, 'primary', deployCmd(app)) : null,
+        admin && app.mode === 'service' ? act1('Restart', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: 'restart' } }); toast('Restarted'); await load(false); drawHead(); }, '', `systemctl restart ${app.unit}`) : null,
+        admin && app.mode === 'service' ? act1(status.active === 'active' ? 'Stop' : 'Start', async () => { await api('/api/apps/service', { method: 'POST', body: { id, action: status.active === 'active' ? 'stop' : 'start' } }); await load(false); drawHead(); }, status.active === 'active' ? 'danger' : '', `systemctl ${status.active === 'active' ? 'stop' : 'start'} ${app.unit}`) : null));
   }
 
   function drawTabs() {
@@ -441,8 +455,8 @@ function pageAppDetail(id) {
     const { app, webhookUrl } = data;
     const card = h('div', { class: 'card', style: { gridColumn: '1 / -1' } }, h('h2', {}, 'Auto-deploy webhook',
       h('span', { class: 'row' },
-        h('button', { class: 'sm', onclick: async () => { await api('/api/apps/webhook', { method: 'POST', body: { id, enabled: true } }); await load(); } }, webhookUrl ? 'Rotate secret' : 'Enable'),
-        webhookUrl ? h('button', { class: 'sm danger', onclick: async () => { await api('/api/apps/webhook', { method: 'POST', body: { id, enabled: false } }); await load(); } }, 'Disable') : null)));
+        h('button', { class: 'sm', cmd: 'panel: creates a new secret URL for the deploy webhook', onclick: async () => { await api('/api/apps/webhook', { method: 'POST', body: { id, enabled: true } }); await load(); } }, webhookUrl ? 'Rotate secret' : 'Enable'),
+        webhookUrl ? h('button', { class: 'sm danger', cmd: 'panel: turns the webhook off', onclick: async () => { await api('/api/apps/webhook', { method: 'POST', body: { id, enabled: false } }); await load(); } }, 'Disable') : null)));
     if (!webhookUrl) { card.append(h('div', { class: 'muted' }, 'Off. Enable it to deploy automatically whenever you push to ', h('code', {}, app.branch), ' (GitHub webhook or any CI that can POST to a URL).')); return card; }
     const token = webhookUrl.split('/').pop();
     card.append(
@@ -481,7 +495,7 @@ function pageAppDetail(id) {
         { key: 'current', label: '', sortable: false, render: (r) => (r.current ? h('span', { class: 'badge ok' }, 'live') : '') },
       ],
       rows: rel, empty: '', sort: { key: 'time', dir: 'desc', onSort() {} },
-      rowActions: isAdminUser() ? (r) => (r.current ? null : (() => { const b = h('button', { class: 'sm' }, 'Roll back to this'); b.onclick = act(b, async () => {
+      rowActions: isAdminUser() ? (r) => (r.current ? null : (() => { const b = h('button', { class: 'sm', cmd: `ln -sfn ${data.app.baseDir}/${data.app.name}/releases/${r.id} ${data.app.baseDir}/${data.app.name}/current\n${data.app.mode === 'service' ? `systemctl restart ${data.app.unit}   # then checks the old release is healthy` : 'reload the web server, then checks the site answers'}` }, 'Roll back to this'); b.onclick = act(b, async () => {
         if (!(await confirmDialog('Roll back?', `Make release ${r.id} (${shortSha(r.commit)}) live and restart ${data.app.name}.`, 'Roll back', false))) return;
         const d = await api('/api/apps/rollback', { method: 'POST', body: { id, release: r.id } });
         logModal(`Rolling back ${data.app.name}`, { url: `/api/deploys/log?id=${d.deploy.id}`, onDone: () => load() });
@@ -500,10 +514,10 @@ function pageAppDetail(id) {
     const names = h('div', { class: 'chips', style: { marginBottom: '12px' } }, app.envNames.map((n) => h('span', { class: 'chip mono' }, n)));
     const area = h('textarea', { rows: 14, spellcheck: false, disabled: true, class: 'editor', style: { minHeight: '260px', whiteSpace: 'pre' }, placeholder: 'Values are hidden until you click “Reveal & edit”.' });
     const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-    const reveal = h('button', { class: 'primary' }, 'Reveal & edit');
-    const save = h('button', { class: 'hidden' }, 'Save');
+    const reveal = h('button', { class: 'primary', cmd: 'panel: decrypts the stored environment variables and shows them (recorded in the audit log)' }, 'Reveal & edit');
+    const save = h('button', { class: 'hidden', cmd: 'panel: stores the variables encrypted. Nothing runs on the server until you apply or deploy.' }, 'Save');
     const isStatic = app.mode === 'static';
-    const apply = h('button', { class: 'primary hidden' }, isStatic ? 'Save & redeploy' : 'Save & apply now');
+    const apply = h('button', { class: 'primary hidden', cmd: isStatic ? deployCmd(app) : `write ${app.baseDir}/${app.name}/shared/.env and env file\nsystemctl restart ${app.unit || 'php-fpm'}` }, isStatic ? 'Save & redeploy' : 'Save & apply now');
     const cancel = h('button', { class: 'hidden' }, 'Cancel');
     const show = (msg) => { err.textContent = msg; err.classList.toggle('hidden', !msg); };
     const lock = () => { area.disabled = true; area.value = ''; for (const b of [save, apply, cancel]) b.classList.add('hidden'); reveal.classList.remove('hidden'); show(''); };
@@ -537,13 +551,13 @@ function pageAppDetail(id) {
     const admin = isAdminUser();
     const form = appForm(app, [], PRESET_LIST || [], null);
     const err = h('div', { class: 'alert crit hidden', role: 'alert' });
-    const save = h('button', { class: 'primary' }, 'Save settings');
+    const save = h('button', { class: 'primary', cmd: 'panel: saves the settings. They are used on the next deploy.' }, 'Save settings');
     save.onclick = act(save, async () => {
       err.classList.add('hidden');
       try { const body = form.read(); delete body.env; await api('/api/apps', { method: 'PUT', body: { id, ...body } }); toast('Saved. Settings apply on the next deploy.'); await load(); }
       catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
-    const del = h('button', { class: 'danger' }, 'Delete app…');
+    const del = h('button', { class: 'danger', cmd: `systemctl stop ${app.unit || '<app service>'}; systemctl disable ...; rm ${app.unit ? '<unit file>' : ''}\nrm -rf ${app.baseDir}/${app.name}   # only if you tick “also delete the files”` }, 'Delete app…');
     del.onclick = () => {
       const files = h('input', { type: 'checkbox' });
       const close = modal(`Delete ${app.name}?`, h('div', {}, h('p', {}, 'The service is stopped and removed. Domains that point at this app keep working against its port.'),
@@ -566,7 +580,7 @@ function pageAppDetail(id) {
     }
     poll(() => (follow.checked ? refresh() : null), 3000);
     refresh().catch((e) => { out.textContent = e.message; });
-    return h('div', {}, h('div', { class: 'toolbar' }, lines, h('label', { class: 'row' }, follow, 'Follow'), h('button', { onclick: () => refresh().catch(fail) }, 'Refresh')), out);
+    return h('div', {}, h('div', { class: 'toolbar' }, lines, h('label', { class: 'row' }, follow, 'Follow'), h('button', { cmd: `journalctl -u ${app.unit || '<service>'} -n <lines> --no-pager`, onclick: () => refresh().catch(fail) }, 'Refresh')), out);
   }
 
   load().catch((e) => { root.replaceChildren(h('div', { class: 'notice' }, e.message), h('p', {}, h('a', { href: '#/deploy' }, '← Back to apps'))); });

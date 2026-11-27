@@ -20,13 +20,13 @@ function nginxCard(onChange) {
     let s;
     try { s = await api('/api/nginx/status'); } catch (e) { box.replaceChildren(h('h2', {}, 'nginx'), h('div', { class: 'notice' }, e.message)); return; }
     const admin = isAdminUser();
-    const btn = (label, path, msg) => { const b = h('button', { class: 'sm' }, label); b.onclick = act(b, async () => { const r = await api(path, { method: 'POST', body: {} }); toast(msg(r)); await load(); if (onChange) onChange(); }); return b; };
+    const btn = (label, path, msg) => { const b = h('button', { class: 'sm', cmd: 'nginx -t   # checks the configuration first\nsystemctl reload nginx   # only if the check passed' }, label); b.onclick = act(b, async () => { const r = await api(path, { method: 'POST', body: {} }); toast(msg(r)); await load(); if (onChange) onChange(); }); return b; };
     if (!s.installed) {
       box.replaceChildren(h('h2', {}, 'nginx'), h('div', { class: 'alert' }, 'nginx is not installed on this server. '), h('a', { href: '#/deploy' }, 'Install it from Deploy → Server readiness'));
       return;
     }
     box.replaceChildren(
-      h('h2', {}, 'nginx', h('span', { class: 'row' }, admin ? h('button', { class: 'sm', onclick: () => nginxFilesDialog(load) }, 'Edit config files…') : null, admin ? btn('Test & reload', '/api/nginx/reload', () => 'Configuration is valid and nginx was reloaded') : null)),
+      h('h2', {}, 'nginx', h('span', { class: 'row' }, admin ? h('button', { class: 'sm', cmd: 'panel: opens the files in /etc/nginx for editing. Saving runs nginx -t and rolls back if it fails.', onclick: () => nginxFilesDialog(load) }, 'Edit config files…') : null, admin ? btn('Test & reload', '/api/nginx/reload', () => 'Configuration is valid and nginx was reloaded') : null)),
       h('div', { class: 'chips' },
         h('span', { class: 'chip ' + (s.active ? 'ok' : 'bad') }, s.active ? '✓ running' : '✕ not running', h('span', { class: 'muted' }, ` v${s.version}`)),
         h('span', { class: 'chip ' + (s.configOk ? 'ok' : 'bad') }, s.configOk ? '✓ config valid' : '✕ config invalid'),
@@ -45,8 +45,8 @@ function nginxFilesDialog(onSaved) {
   const area = h('textarea', { class: 'editor', spellcheck: false, disabled: true, style: { minHeight: '50vh', whiteSpace: 'pre' }, placeholder: 'Choose a file on the left.' });
   const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap', maxHeight: '160px', overflow: 'auto' } });
   const title = h('div', { class: 'mono muted', style: { marginBottom: '6px', minHeight: '18px' } });
-  const save = h('button', { class: 'primary', disabled: true }, 'Save & reload');
-  const del = h('button', { class: 'danger hidden' }, 'Delete file');
+  const save = h('button', { class: 'primary', disabled: true, cmd: 'cp <file> <file>.bak   # backup\ntee <file>   # writes your text\nnginx -t   # on failure the backup is restored\nsystemctl reload nginx' }, 'Save & reload');
+  const del = h('button', { class: 'danger hidden', cmd: 'rm /etc/nginx/conf.d/<file>\nnginx -t && systemctl reload nginx' }, 'Delete file');
   const show = (m) => { err.textContent = m || ''; err.classList.toggle('hidden', !m); };
 
   async function refresh(select) {
@@ -81,7 +81,7 @@ function nginxFilesDialog(onSaved) {
     if (!(await confirmDialog('Delete file?', `${current.name} will be removed and nginx reloaded. If nginx rejects the result the file is restored.`, 'Delete'))) return;
     try { await api(`/api/nginx/file?name=${encodeURIComponent(current.name)}`, { method: 'DELETE' }); toast('Deleted'); current = null; area.value = ''; area.disabled = true; save.disabled = true; del.classList.add('hidden'); title.textContent = ''; await refresh(); if (onSaved) onSaved(); } catch (e) { show(e.message); }
   };
-  const newFile = h('button', { class: 'sm' }, '+ New file');
+  const newFile = h('button', { class: 'sm', cmd: 'panel: starts a new empty file. It is only written when you save.' }, '+ New file');
   newFile.onclick = async () => {
     const name = await promptDialog('New nginx file', 'File name inside conf.d (e.g. redirects.conf)', 'custom.conf');
     if (!name) return;
@@ -112,7 +112,7 @@ function discoveryCard(onAdopted) {
           { key: 'https', label: 'HTTPS', render: (x) => h('span', { class: 'badge ' + (x.https ? 'ok' : '') }, x.https ? 'yes' : 'no') },
           { key: 'file', label: 'File', render: (x) => h('code', {}, x.file) },
         ], rows, empty: '',
-        rowActions: (x) => { const b = h('button', { class: 'sm primary' }, 'Add to panel'); b.onclick = act(b, async () => { const a = await api('/api/sites/adopt', { method: 'POST', body: { file: x.file } }); toast(`${a.site.domain} added; the file was not changed`); onAdopted(a.site); }); return b; },
+        rowActions: (x) => { const b = h('button', { class: 'sm primary', cmd: 'panel: starts managing this existing nginx site. The file on the server is left exactly as it is.' }, 'Add to panel'); b.onclick = act(b, async () => { const a = await api('/api/sites/adopt', { method: 'POST', body: { file: x.file } }); toast(`${a.site.domain} added; the file was not changed`); onAdopted(a.site); }); return b; },
       }));
   }
   load().catch(() => box.classList.add('hidden'));
@@ -127,7 +127,7 @@ function showWarnings(list) {
 /** Look inside the folder: the panel picks the web root, the type (PHP / static) and the framework's nginx settings. */
 function folderChecker(f, field) {
   const msg = h('div', { class: 'muted', style: { fontSize: '12.5px', margin: '4px 0 10px' } });
-  const btn = h('button', { type: 'button' }, 'Check folder');
+  const btn = h('button', { type: 'button', cmd: 'test -e <folder>/artisan; test -e <folder>/public/index.php; test -e <folder>/wp-config.php; ...   # only looks, changes nothing' }, 'Check folder');
   btn.onclick = act(btn, async () => {
     msg.textContent = 'Looking inside the folder…';
     const r = await api('/api/sites/inspect-folder', { method: 'POST', body: { path: f[field].value.trim() } });
@@ -244,7 +244,7 @@ function pageDomains() {
   const add = () => {
     const form = siteForm(null, apps);
     const err = h('div', { class: 'alert crit hidden', role: 'alert' });
-    const create = h('button', { class: 'primary' }, 'Add domain');
+    const create = h('button', { class: 'primary', cmd: 'tee /etc/nginx/conf.d/panel-<domain>.conf   # the generated site\nnginx -t   # rolled back if it fails\nsystemctl reload nginx' }, 'Add domain');
     const close = modal('Add domain', h('div', {}, err, form.el, h('div', { class: 'actions' }, h('button', { onclick: () => close() }, 'Cancel'), create)), { wide: true });
     create.onclick = act(create, async () => {
       err.classList.add('hidden');
@@ -252,7 +252,7 @@ function pageDomains() {
       catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
     });
   };
-  return h('div', {}, pageHeader('Domains', `nginx sites, HTTPS certificates and DNS checks on ${(currentServer() || {}).name || 'this server'}`, admin ? h('button', { class: 'primary', onclick: add }, 'Add domain') : null),
+  return h('div', {}, pageHeader('Domains', `nginx sites, HTTPS certificates and DNS checks on ${(currentServer() || {}).name || 'this server'}`, admin ? h('button', { class: 'primary', cmd: 'panel: opens the form. Nothing runs until you press Add domain inside it.', onclick: add }, 'Add domain') : null),
     nginxCard(() => load().catch(() => {})), admin ? discoveryCard((site) => { location.hash = `#/domains/${site.id}`; }) : '', box);
 }
 
@@ -341,7 +341,7 @@ function pageDomainDetail(id) {
   function overview() {
     const wrap = h('div', {});
     const result = h('div', {});
-    const run = h('button', { class: 'primary' }, checks.dns ? 'Re-run checks' : 'Run checks');
+    const run = h('button', { class: 'primary', cmd: 'panel: looks up DNS records (A, AAAA, CNAME, CAA) and requests the site over HTTP and HTTPS from the panel host. Nothing runs on the server.' }, checks.dns ? 'Re-run checks' : 'Run checks');
     const draw = () => {
       result.replaceChildren(dnsPanel() || '', httpPanel() || '');
       checkCard.replaceChildren(h('h2', {}, 'Setup checklist', run), checklist());
@@ -370,12 +370,12 @@ function pageDomainDetail(id) {
       card.append(kv([['Issuer', cert.issuer || '–'], ['Expires', cert.validTo ? `${fmt.date(cert.validTo)} (${cert.daysLeft} days)` : '–'], ['Covers', (cert.names || []).join(', ')], ['Type', site.tls.staging ? h('span', { class: 'badge warn' }, 'STAGING (test certificate, not trusted by browsers)') : 'Production'], ['Contact', site.tls.email]]),
         h('div', { class: 'muted', style: { margin: '8px 0', fontSize: '12.5px' } }, 'Renewed automatically by the certbot timer twice a day when due (30 days before expiry).'));
       if (admin) card.append(h('div', { class: 'row' },
-        (() => { const b = h('button', {}, 'Renew now'); b.onclick = act(b, async () => { const r = await api('/api/sites/cert/renew', { method: 'POST', body: { id } }); toast('Certificate renewed'); await load(); modal('certbot output', h('pre', { class: 'out' }, r.output), { wide: true, actions: [{ label: 'Close', onclick: (c) => c() }] }); }); return b; })(),
-        site.tls.staging ? (() => { const b = h('button', { class: 'primary' }, 'Replace with a real certificate'); b.onclick = () => issueDialog(); return b; })() : null,
-        h('button', { class: 'danger', onclick: async () => { if (await confirmDialog('Remove certificate?', `${site.domain} will be served over HTTP only until you issue a new certificate.`, 'Remove')) try { await api('/api/sites/cert/remove', { method: 'POST', body: { id } }); toast('Certificate removed'); await load(); } catch (e) { fail(e); } } }, 'Remove certificate')));
+        (() => { const b = h('button', { cmd: 'certbot renew --cert-name <domain> --force-renewal --non-interactive\nsystemctl reload nginx   # via the deploy hook' }, 'Renew now'); b.onclick = act(b, async () => { const r = await api('/api/sites/cert/renew', { method: 'POST', body: { id } }); toast('Certificate renewed'); await load(); modal('certbot output', h('pre', { class: 'out' }, r.output), { wide: true, actions: [{ label: 'Close', onclick: (c) => c() }] }); }); return b; })(),
+        site.tls.staging ? (() => { const b = h('button', { class: 'primary', cmd: 'panel: opens the certificate request form' }, 'Replace with a real certificate'); b.onclick = () => issueDialog(); return b; })() : null,
+        h('button', { class: 'danger', cmd: 'certbot delete --cert-name <domain> --non-interactive\nrewrites the site as HTTP-only; nginx -t && systemctl reload nginx', onclick: async () => { if (await confirmDialog('Remove certificate?', `${site.domain} will be served over HTTP only until you issue a new certificate.`, 'Remove')) try { await api('/api/sites/cert/remove', { method: 'POST', body: { id } }); toast('Certificate removed'); await load(); } catch (e) { fail(e); } } }, 'Remove certificate')));
     } else {
       card.append(h('div', { class: 'muted', style: { marginBottom: '10px' } }, 'No certificate yet. Before issuing: the domain’s DNS must point at this server and port 80 must be open in the security group — run the checks above first. Let’s Encrypt validates over HTTP on port 80.'));
-      if (admin) card.append(h('button', { class: 'primary', onclick: () => issueDialog() }, 'Issue certificate…'));
+      if (admin) card.append(h('button', { class: 'primary', cmd: 'panel: opens the certificate request form', onclick: () => issueDialog() }, 'Issue certificate…'));
       else card.append(h('div', { class: 'muted' }, 'An administrator can issue the certificate.'));
     }
     return card;
@@ -387,7 +387,7 @@ function pageDomainDetail(id) {
     const email = h('input', { type: 'email', value: saved, placeholder: 'you@example.com' });
     const staging = h('input', { type: 'checkbox' });
     const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-    const go = h('button', { class: 'primary' }, 'Request certificate');
+    const go = h('button', { class: 'primary', cmd: 'certbot certonly --webroot -w <acme folder> --cert-name <domain> -d <domain> [-d <alias>] --email <you> --agree-tos --non-interactive --deploy-hook "systemctl reload nginx"\nthen rewrites the site for HTTPS; nginx -t && systemctl reload nginx' }, 'Request certificate');
     const close = modal('Issue certificate', h('div', {}, err,
       h('div', { class: 'field' }, h('label', {}, 'Email for expiry notices'), email),
       h('label', { class: 'row' }, staging, 'Use the Let’s Encrypt staging server (test run: no rate limits, but the certificate is not trusted)'),
@@ -409,7 +409,7 @@ function pageDomainDetail(id) {
     const admin = isAdminUser();
     const form = siteForm(site, apps);
     const err = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap' } });
-    const save = h('button', { class: 'primary' }, 'Save & apply');
+    const save = h('button', { class: 'primary', cmd: 'tee /etc/nginx/conf.d/panel-<domain>.conf   # regenerated from these settings\nnginx -t   # the previous file is restored if it fails\nsystemctl reload nginx' }, 'Save & apply');
     save.onclick = act(save, async () => {
       err.classList.add('hidden');
       try { const sv = await api('/api/sites', { method: 'PUT', body: { id, ...form.read() } }); showWarnings(sv.warnings); toast('Saved. nginx reloaded.'); await load(); } catch (e) { err.textContent = e.message; err.classList.remove('hidden'); }
@@ -423,7 +423,7 @@ function pageDomainDetail(id) {
       if (editing) {
         const area = h('textarea', { class: 'editor', spellcheck: false, style: { minHeight: '46vh', whiteSpace: 'pre' }, value: manual ? site.rawConfig : generated.text });
         const e2 = h('div', { class: 'alert crit hidden', role: 'alert', style: { whiteSpace: 'pre-wrap', maxHeight: '180px', overflow: 'auto' } });
-        const saveRaw = h('button', { class: 'primary' }, 'Save file & apply');
+        const saveRaw = h('button', { class: 'primary', cmd: 'tee /etc/nginx/conf.d/panel-<domain>.conf   # exactly your text\nnginx -t   # the previous file is restored if it fails\nsystemctl reload nginx' }, 'Save file & apply');
         saveRaw.onclick = act(saveRaw, async () => {
           e2.classList.add('hidden');
           try { await api('/api/sites', { method: 'PUT', body: { id, rawConfig: area.value } }); toast('Manual configuration applied. nginx validated and reloaded.'); await load(); } catch (er) { e2.textContent = er.message; e2.classList.remove('hidden'); }
@@ -443,9 +443,9 @@ function pageDomainDetail(id) {
         h('div', { class: 'muted', style: { marginTop: '8px', fontSize: '12px' } }, manual ? 'Settings on the left (aliases, upstream, HTTPS) do not affect this file while manual mode is on.' : 'The panel owns this file. Use the settings on the left, “custom directives”, or manual mode; hand edits on the server are flagged and overwritten on the next apply.'));
     }
     if (admin) api(`/api/sites/config?id=${id}`).then((r) => { generated.text = r.config; drawRight(false); }).catch((e) => { generated.text = e.message; drawRight(false); });
-    const reapply = h('button', {}, 'Re-apply to server');
+    const reapply = h('button', { cmd: 'tee /etc/nginx/conf.d/panel-<domain>.conf   # rewrites the generated file\nnginx -t && systemctl reload nginx' }, 'Re-apply to server');
     reapply.onclick = act(reapply, async () => { await api('/api/sites/apply', { method: 'POST', body: { id } }); toast('Configuration re-applied'); await load(); });
-    const del = h('button', { class: 'danger' }, 'Delete domain…');
+    const del = h('button', { class: 'danger', cmd: 'rm /etc/nginx/conf.d/panel-<domain>.conf\nnginx -t && systemctl reload nginx\ncertbot delete --cert-name <domain>   # only if you tick it' }, 'Delete domain…');
     del.onclick = () => {
       const cert = h('input', { type: 'checkbox', checked: !!site.tls });
       modal(`Delete ${site.domain}?`, h('div', {}, h('p', {}, 'The nginx site is removed and nginx reloaded. The app and its files are not touched.'), site.tls ? h('label', { class: 'row' }, cert, 'Also delete its certificate') : null),
@@ -472,7 +472,7 @@ function pageDomainDetail(id) {
     }
     poll(() => (follow.checked ? refresh() : null), 3000);
     refresh().catch((e) => { out.textContent = e.message; });
-    return h('div', {}, h('div', { class: 'toolbar' }, kind, lines, h('label', { class: 'row' }, follow, 'Follow'), h('button', { onclick: () => refresh().catch(fail) }, 'Refresh')), out);
+    return h('div', {}, h('div', { class: 'toolbar' }, kind, lines, h('label', { class: 'row' }, follow, 'Follow'), h('button', { cmd: 'tail -c 2097152 /var/log/nginx/<domain>.access.log   # or the error log', onclick: () => refresh().catch(fail) }, 'Refresh')), out);
   }
 
   load().catch((e) => { root.replaceChildren(h('div', { class: 'notice' }, e.message), h('p', {}, h('a', { href: '#/domains' }, '← Back to domains'))); });
